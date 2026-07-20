@@ -3,7 +3,7 @@ name: Credit Reminder Bot
 on:
   schedule:
     - cron: "*/10 * * * *"
-    - cron: "0 0 * * *"
+    - cron: "30 18 * * *"
   workflow_dispatch:
 
 jobs:
@@ -22,7 +22,7 @@ jobs:
         run: |
           MINUTE=$(date -u +%M)
           HOUR=$(date -u +%H)
-          if [ "$HOUR" == "00" ] && [ "$MINUTE" == "00" ]; then
+          if [ "$HOUR" == "18" ] && [ "$MINUTE" == "30" ]; then
             echo "mode=reset" >> "$GITHUB_OUTPUT"
           else
             echo "mode=check" >> "$GITHUB_OUTPUT"
