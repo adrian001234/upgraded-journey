@@ -4,10 +4,9 @@ Pulls trending tech / AI / science headlines from free RSS feeds.
 Selects only the single most recent headline for this run.
 No API key required.
 """
-
 import feedparser
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
 # Free, no-key-required RSS feeds covering tech / AI / science
@@ -21,12 +20,15 @@ FEEDS = {
 
 
 def _parse_date(entry):
-    """Best-effort parse of an entry's published date. Falls back to epoch 0 if missing/bad."""
+    """Best-effort parse of an entry's published date. Falls back to epoch (UTC) if missing/bad."""
     raw = entry.get("published", "")
     try:
-        return parsedate_to_datetime(raw)
+        dt = parsedate_to_datetime(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except Exception:
-        return datetime.min
+        return datetime.min.replace(tzinfo=timezone.utc)
 
 
 def fetch_headlines(limit_per_source=5):
