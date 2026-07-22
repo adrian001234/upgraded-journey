@@ -14,11 +14,12 @@ AGNES_KEY = os.environ["AGNES_API_KEY"]
 
 def create_agnes_task(script_text):
     body = json.dumps({
+        "model": "agnes-video",
         "prompt": script_text,
         "duration": 40,
     }).encode()
     req = urllib.request.Request(
-        f"{AGNES_URL}/v1/video/generate",
+        f"{AGNES_URL}/video/generate",
         data=body,
         headers={
             "Authorization": f"Bearer {AGNES_KEY}",
@@ -27,13 +28,14 @@ def create_agnes_task(script_text):
     )
     with urllib.request.urlopen(req) as resp:
         result = json.loads(resp.read())
-        return result["task_id"]
+        return result["video_id"]
 
 
-def poll_agnes_task(task_id, max_retries=20, delay=15):
+def poll_agnes_task(video_id, max_retries=20, delay=15):
+    base = AGNES_URL.replace("/v1", "")
     for _ in range(max_retries):
         req = urllib.request.Request(
-            f"{AGNES_URL}/v1/video/status/{task_id}",
+            f"{base}/agnesapi?video_id={video_id}",
             headers={"Authorization": f"Bearer {AGNES_KEY}"},
         )
         with urllib.request.urlopen(req) as resp:
@@ -53,8 +55,8 @@ def generate_videos(scripts_path="script/latest_scripts.json", out_path="video/l
     videos = []
     for s in scripts:
         try:
-            task_id = create_agnes_task(s["script"])
-            video_url = poll_agnes_task(task_id)
+            video_id = create_agnes_task(s["script"])
+            video_url = poll_agnes_task(video_id)
             if video_url:
                 videos.append({**s, "video_url": video_url})
                 print(f"Generated video for: {s['title']}")
