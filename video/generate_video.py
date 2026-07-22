@@ -14,12 +14,13 @@ AGNES_KEY = os.environ["AGNES_API_KEY"]
 
 def create_agnes_task(script_text):
     body = json.dumps({
-        "model": "agnes-video",
+        "model": "agnes-video-v2.0",
         "prompt": script_text,
-        "duration": 40,
+        "num_frames": 121,
+        "frame_rate": 24,
     }).encode()
     req = urllib.request.Request(
-        f"{AGNES_URL}/video/generate",
+        f"{AGNES_URL}/videos",
         data=body,
         headers={
             "Authorization": f"Bearer {AGNES_KEY}",
@@ -41,7 +42,7 @@ def poll_agnes_task(video_id, max_retries=20, delay=15):
         with urllib.request.urlopen(req) as resp:
             result = json.loads(resp.read())
             if result.get("status") == "completed":
-                return result.get("video_url")
+                return result.get("video_url") or result.get("url")
             if result.get("status") == "failed":
                 return None
         time.sleep(delay)
