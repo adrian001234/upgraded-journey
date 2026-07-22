@@ -1,6 +1,8 @@
 """
 TechPulse - Video Stage
-Sends each script to Agnes AI for video generation using pre-claimed free credits.
+Sends each script's visual description to Agnes AI for video generation
+using pre-claimed free credits. Narration text is carried through for the
+upcoming narration/assembly stages.
 """
 
 import json
@@ -12,10 +14,10 @@ AGNES_URL = os.environ["AGNES_API_URL"]
 AGNES_KEY = os.environ["AGNES_API_KEY"]
 
 
-def create_agnes_task(script_text):
+def create_agnes_task(visual_prompt):
     body = json.dumps({
         "model": "agnes-video-v2.0",
-        "prompt": script_text,
+        "prompt": visual_prompt,
         "num_frames": 121,
         "frame_rate": 24,
     }).encode()
@@ -56,7 +58,7 @@ def generate_videos(scripts_path="script/latest_scripts.json", out_path="video/l
     videos = []
     for s in scripts:
         try:
-            video_id = create_agnes_task(s["script"])
+            video_id = create_agnes_task(s["visual"])
             video_url = poll_agnes_task(video_id)
             if video_url:
                 videos.append({**s, "video_url": video_url})
