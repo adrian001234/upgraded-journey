@@ -1,12 +1,14 @@
 """
 TechPulse - Research Stage
 Pulls trending tech / AI / science headlines from free RSS feeds.
+Selects only the single most recent headline for this run.
 No API key required.
 """
 
 import feedparser
 import json
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 
 # Free, no-key-required RSS feeds covering tech / AI / science
 FEEDS = {
@@ -16,6 +18,15 @@ FEEDS = {
     "mit_tech_review": "https://www.technologyreview.com/feed/",
     "science_daily": "https://www.sciencedaily.com/rss/top/technology.xml",
 }
+
+
+def _parse_date(entry):
+    """Best-effort parse of an entry's published date. Falls back to epoch 0 if missing/bad."""
+    raw = entry.get("published", "")
+    try:
+        return parsedate_to_datetime(raw)
+    except Exception:
+        return datetime.min
 
 
 def fetch_headlines(limit_per_source=5):
@@ -31,17 +42,29 @@ def fetch_headlines(limit_per_source=5):
                 "link": entry.get("link", ""),
                 "published": entry.get("published", ""),
                 "fetched_at": datetime.utcnow().isoformat(),
+                "_sort_date": _parse_date(entry),
             })
     return results
 
 
+def select_top_headline(headlines):
+    """Pick the single most recent headline across all sources."""
+    if not headlines:
+        return []
+    ranked = sorted(headlines, key=lambda h: h["_sort_date"], reverse=True)
+    top = ranked[0]
+    top.pop("_sort_date", None)
+    return [top]
+
+
 def save_headlines(headlines, path="research/latest_headlines.json"):
-    """Save fetched headlines to a JSON file."""
+    """Save selected headline(s) to a JSON file."""
     with open(path, "w") as f:
         json.dump(headlines, f, indent=2)
-    print(f"Saved {len(headlines)} headlines to {path}")
+    print(f"Saved {len(headlines)} headline(s) to {path}")
 
 
 if __name__ == "__main__":
-    headlines = fetch_headlines()
-    save_headlines(headlines)
+    all_headlines = fetch_headlines()
+    selected = select_top_headline(all_headlines)
+    save_headlines(selected)
