@@ -28,3 +28,8 @@ jobs:
           AGNES_API_URL: ${{ secrets.AGNES_API_URL }}
           AGNES_API_KEY: ${{ secrets.AGNES_API_KEY }}
         run: python video/generate_video.py
+      - name: Tracking stage
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: python tracking/save_to_supabase.py
