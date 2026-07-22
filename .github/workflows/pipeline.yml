@@ -1,0 +1,30 @@
+name: TechPulse Pipeline
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install feedparser
+      - name: Research stage
+        run: python research/sources.py
+      - name: Script stage
+        env:
+          FREELLM_API_URL: ${{ secrets.FREELLM_API_URL }}
+          FREELLM_API_KEY: ${{ secrets.FREELLM_API_KEY }}
+        run: python script/generate_script.py
+      - name: Video stage
+        env:
+          AGNES_API_URL: ${{ secrets.AGNES_API_URL }}
+          AGNES_API_KEY: ${{ secrets.AGNES_API_KEY }}
+        run: python video/generate_video.py
