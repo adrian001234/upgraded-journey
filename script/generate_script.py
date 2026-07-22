@@ -1,6 +1,7 @@
 """
 TechPulse - Script Stage
-Turns fetched headlines into a short news-brief script via FreeLLMAPI.
+Turns fetched headlines into a hook-first news-brief script + a separate
+visual scene prompt (for the video stage), via FreeLLMAPI.
 """
 
 import json
@@ -10,11 +11,16 @@ import urllib.request
 FREELLM_URL = os.environ["FREELLM_API_URL"]
 FREELLM_KEY = os.environ["FREELLM_API_KEY"]
 
-PROMPT_TEMPLATE = """You are writing a short, punchy tech/AI/science news-brief script for a YouTube Short.
+PROMPT_TEMPLATE = """You are writing a YouTube Short for a tech/AI/science news channel.
 Headline: {title}
 Summary: {summary}
 
-Write a 30-45 second spoken script (roughly 80-110 words). Style: fast hook in the first line, plain conversational language, no fluff, end with a punchy one-liner. Output ONLY the script text, nothing else."""
+Write TWO separate things:
+1. NARRATION: A 30-40 second spoken voiceover script (90-120 words). Start with a scroll-stopping hook in the very first sentence (a bold claim, surprising number, or curiosity-gap question) — no slow lead-in. Keep every sentence short and easy to say out loud. No filler, no robotic phrasing, no repeated words. End with a punchy one-line payoff (not a generic "and that's it").
+2. VISUAL: A single cinematic scene description (1-2 sentences) for an AI video generator to render as B-roll footage that matches the story's mood — describe camera angle, lighting, and setting. Do NOT restate the narration word-for-word; describe what should be SEEN, not what should be SAID.
+
+Output strict JSON only, no other text:
+{{"narration": "...", "visual": "..."}}"""
 
 
 def call_freellm(prompt):
@@ -43,12 +49,15 @@ def generate_scripts(headlines_path="research/latest_headlines.json", out_path="
     for h in headlines:
         prompt = PROMPT_TEMPLATE.format(title=h["title"], summary=h["summary"])
         try:
-            script_text = call_freellm(prompt)
+            raw = call_freellm(prompt)
+            raw = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            parsed = json.loads(raw)
             scripts.append({
                 "source": h["source"],
                 "title": h["title"],
                 "link": h["link"],
-                "script": script_text,
+                "narration": parsed["narration"],
+                "visual": parsed["visual"],
             })
         except Exception as e:
             print(f"Failed on {h['title']}: {e}")
