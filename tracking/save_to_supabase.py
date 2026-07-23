@@ -38,7 +38,7 @@ def sync_videos(videos_path="video/latest_videos.json"):
                 "title": v["title"],
                 "source": v["source"],
                 "link": v["link"],
-                "script": v["script"],
+                "script": v.get("narration", ""),
                 "video_url": v["video_url"],
                 "status": "video_generated",
             })
