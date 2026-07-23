@@ -7,6 +7,7 @@ visual scene prompt (for the video stage), via FreeLLMAPI.
 import json
 import os
 import urllib.request
+import urllib.error
 
 FREELLM_URL = os.environ["FREELLM_API_URL"]
 FREELLM_KEY = os.environ["FREELLM_API_KEY"]
@@ -36,9 +37,33 @@ def call_freellm(prompt):
             "Content-Type": "application/json",
         },
     )
-    with urllib.request.urlopen(req) as resp:
-        result = json.loads(resp.read())
-        return result["choices"][0]["message"]["content"].strip()
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            status = resp.status
+            routed_via = resp.headers.get("X-Routed-Via", "unknown")
+            raw_bytes = resp.read()
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode(errors="replace")[:500]
+        raise RuntimeError(f"HTTP {e.code} from FreeLLMAPI. Body: {error_body}") from e
+
+    if not raw_bytes.strip():
+        raise RuntimeError(f"FreeLLMAPI returned an EMPTY body. Status={status}, routed via={routed_via}")
+
+    try:
+        result = json.loads(raw_bytes)
+    except json.JSONDecodeError as e:
+        preview = raw_bytes[:500].decode(errors="replace")
+        raise RuntimeError(f"FreeLLMAPI response wasn't valid JSON. Status={status}, routed via={routed_via}. Body preview: {preview}") from e
+
+    try:
+        content = result["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as e:
+        raise RuntimeError(f"Unexpected response shape from FreeLLMAPI (routed via {routed_via}): {json.dumps(result)[:500]}") from e
+
+    if not content or not content.strip():
+        raise RuntimeError(f"FreeLLMAPI returned an empty completion (routed via {routed_via}). The model it picked gave back nothing.")
+
+    return content.strip()
 
 
 def generate_scripts(headlines_path="research/latest_headlines.json", out_path="script/latest_scripts.json"):
