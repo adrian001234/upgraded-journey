@@ -1,10 +1,8 @@
 """
 TechPulse - Video Stage
-Sends each script's visual description to Agnes AI for video generation
-using pre-claimed free credits. Narration text is carried through for the
-upcoming narration/assembly stages.
+Sends each scene's visual description to Agnes AI for video generation
+using pre-claimed free credits. Produces one clip per scene.
 """
-
 import json
 import os
 import time
@@ -57,16 +55,24 @@ def generate_videos(scripts_path="script/latest_scripts.json", out_path="video/l
 
     videos = []
     for s in scripts:
-        try:
-            video_id = create_agnes_task(s["visual"])
-            video_url = poll_agnes_task(video_id)
-            if video_url:
-                videos.append({**s, "video_url": video_url})
-                print(f"Generated video for: {s['title']}")
-            else:
-                print(f"Failed/timed out: {s['title']}")
-        except Exception as e:
-            print(f"Error on {s['title']}: {e}")
+        clip_urls = []
+        for scene in s["scenes"]:
+            try:
+                video_id = create_agnes_task(scene)
+                clip_url = poll_agnes_task(video_id)
+                if clip_url:
+                    clip_urls.append(clip_url)
+                    print(f"  Generated scene clip for: {s['title']}")
+                else:
+                    print(f"  Failed/timed out on a scene for: {s['title']}")
+            except Exception as e:
+                print(f"  Error on a scene for {s['title']}: {e}")
+
+        if clip_urls:
+            videos.append({**s, "clip_urls": clip_urls})
+            print(f"Generated {len(clip_urls)} clips for: {s['title']}")
+        else:
+            print(f"No clips generated for: {s['title']}")
 
     with open(out_path, "w") as f:
         json.dump(videos, f, indent=2)
