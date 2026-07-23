@@ -1,7 +1,8 @@
 """
 TechPulse - Assembly Stage
-Downloads each video clip + its narration audio, muxes them together
-with ffmpeg, outputs a final assembled MP4 per script.
+Downloads each video clip + its narration audio, loops the video to
+cover the full narration length, muxes them together with ffmpeg,
+outputs a final assembled MP4 per script.
 """
 
 import json
@@ -22,9 +23,10 @@ def assemble_one(video_url, audio_path, out_path):
 
     cmd = [
         "ffmpeg", "-y",
+        "-stream_loop", "-1",
         "-i", tmp_video,
         "-i", audio_path,
-        "-c:v", "copy",
+        "-c:v", "libx264",
         "-c:a", "aac",
         "-map", "0:v:0",
         "-map", "1:a:0",
