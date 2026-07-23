@@ -1,11 +1,16 @@
 """
 TechPulse - Research Stage
 Pulls trending tech / AI / science headlines from free RSS feeds.
-Selects only the single most recent headline for this run.
-No API key required.
+Selects the most recent headline that hasn't already been processed
+(checked against the Supabase video_pipeline table).
+No API key required for RSS; Supabase credentials are optional but
+recommended to avoid re-publishing the same story.
 """
 import feedparser
 import json
+import os
+import urllib.request
+import urllib.parse
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
@@ -18,6 +23,9 @@ FEEDS = {
     "science_daily": "https://www.sciencedaily.com/rss/top/technology.xml",
 }
 
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
+
 
 def _parse_date(entry):
     """Best-effort parse of an entry's published date. Falls back to epoch (UTC) if missing/bad."""
@@ -29,6 +37,29 @@ def _parse_date(entry):
         return dt
     except Exception:
         return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _link_already_processed(link):
+    """Check the Supabase video_pipeline table for an existing row with this link."""
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+        print("Warning: SUPABASE_URL/SUPABASE_ANON_KEY not set in this stage — skipping duplicate check.")
+        return False
+    encoded_link = urllib.parse.quote(link, safe="")
+    url = f"{SUPABASE_URL}/rest/v1/video_pipeline?link=eq.{encoded_link}&select=id"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "apikey": SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            rows = json.loads(resp.read())
+            return len(rows) > 0
+    except Exception as e:
+        print(f"Warning: could not reach Supabase to check duplicates ({e}). Proceeding without dedup check for this run.")
+        return False
 
 
 def fetch_headlines(limit_per_source=5):
@@ -50,13 +81,19 @@ def fetch_headlines(limit_per_source=5):
 
 
 def select_top_headline(headlines):
-    """Pick the single most recent headline across all sources."""
+    """Pick the most recent headline that hasn't already been processed."""
     if not headlines:
         return []
     ranked = sorted(headlines, key=lambda h: h["_sort_date"], reverse=True)
-    top = ranked[0]
-    top.pop("_sort_date", None)
-    return [top]
+    for candidate in ranked:
+        link = candidate.get("link", "")
+        if link and _link_already_processed(link):
+            print(f"Skipping already-processed headline: {candidate['title']}")
+            continue
+        candidate.pop("_sort_date", None)
+        return [candidate]
+    print("All candidate headlines this run were already processed — nothing new to publish.")
+    return []
 
 
 def save_headlines(headlines, path="research/latest_headlines.json"):
