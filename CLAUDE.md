@@ -21,8 +21,7 @@ alter comments/code you don't fully understand just because they look unrelated.
 
 ## 4. Goal-Driven Execution, Not Blind Imperatives
 When given a goal (e.g. "fix the tracking sync bug"), verify the fix against a concrete
-success condition (e.g. "tracking stage runs with 0 failures on next pipeline run") —
-don't stop at "I made a change that looks related."
+success condition — don't stop at "I made a change that looks related."
 
 ## 5. No Unilateral Behavior Changes
 Do not change pipeline behavior (auto-upload settings, approval gates, visibility/privacy
@@ -34,8 +33,24 @@ This project's owner is a non-coder working by copy-paste. Every changed file mu
 delivered as a complete file, never as a line-by-line diff or "change line X" instruction.
 
 ## 7. Verify Before Reporting Success
-Do not report a fix as working, or a status as confirmed (e.g. "video is unlisted"),
-without actually checking it. If it can't be verified, say so plainly instead of assuming.
+Do not report a fix as working, or a status as confirmed, without actually checking it.
+If it can't be verified, say so plainly instead of assuming.
+
+## 8. Check Access Before Recommending Tools
+Before suggesting any external tool (Claude Code, TDD Guard, MCP servers, etc.), confirm
+what access the user actually has (terminal/SSH? browser only?) in one line, before
+selling the tool. Don't recommend an ideal solution the user can't reach.
+
+## 9. Verify Every Paste Landed Correctly
+After the user pastes a file in and commits, diff what's now live against what was given,
+without being asked. Given how many past bugs were "looked successful but wasn't," never
+assume a paste succeeded cleanly.
+
+## 10. Re-check the GitHub Write Block Periodically
+Claude's GitHub write access (create_or_update_file) returns 403 here despite full
+read/write showing on the connector — a known Anthropic-side bug, not a permissions
+issue on this repo. Periodically retest it (try a trivial write); if it's been fixed,
+drop the copy-paste workaround.
 
 ## Known past incidents (do not repeat)
 - Backup restore crashed on HTTP 400 from Supabase Storage (only 404 was handled). Fixed
@@ -50,8 +65,8 @@ without actually checking it. If it can't be verified, say so plainly instead of
 
 ## Access notes
 - GitHub write access via the Claude.ai connector is unreliable (403) even when the
-  connector shows full read/write. Read access works. Assume file changes must be
-  handed to the user as full copy-paste content for manual commit unless a write succeeds.
+  connector shows full read/write. Read access works — use it to pull full repo context
+  (e.g. via Repomix) at the start of a session instead of asking the user to paste files.
 - User has no terminal/SSH access — browser dashboards only (GitHub web editor, Render,
   Supabase). Never suggest local dev or CLI commands.
 
@@ -61,6 +76,8 @@ without actually checking it. If it can't be verified, say so plainly instead of
 - Give simple, step-by-step instructions. Perform the task, don't explain it at length.
   Minimal explanation — long write-ups waste his time and tokens.
 - The goal each time is the end result (a working fix, a pasted file, a clicked button),
-  not a lesson in how the code works.
+- not a lesson in how the code works.
 - Every path, URL, or anything to be copied must be given in a copy-paste code block,
   no exceptions.
+
+
