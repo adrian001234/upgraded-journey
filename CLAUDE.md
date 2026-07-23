@@ -36,3 +36,31 @@ delivered as a complete file, never as a line-by-line diff or "change line X" in
 ## 7. Verify Before Reporting Success
 Do not report a fix as working, or a status as confirmed (e.g. "video is unlisted"),
 without actually checking it. If it can't be verified, say so plainly instead of assuming.
+
+## Known past incidents (do not repeat)
+- Backup restore crashed on HTTP 400 from Supabase Storage (only 404 was handled). Fixed
+  in db-backup.ts — readTarget() now treats 400 as "no backup found."
+- FREEAPI_DB_BACKUP_KEY / ENCRYPTION_KEY must be exactly 64 hex characters. A 63-char key
+  silently no-ops the backup instead of erroring loudly — always verify length before
+  assuming it's correct.
+- YT_REFRESH_TOKEN can be valid but scoped to the wrong YouTube channel if the wrong
+  account was selected during OAuth. A working upload to the *wrong* channel (e.g.
+  Erased instead of TechPulse Daily) looks like success in logs — always confirm which
+  channel a token is authorized for, not just that it works.
+
+## Access notes
+- GitHub write access via the Claude.ai connector is unreliable (403) even when the
+  connector shows full read/write. Read access works. Assume file changes must be
+  handed to the user as full copy-paste content for manual commit unless a write succeeds.
+- User has no terminal/SSH access — browser dashboards only (GitHub web editor, Render,
+  Supabase). Never suggest local dev or CLI commands.
+
+## How to work with the project owner
+- He is a non-coder. He runs this project by talking Claude through it, step by step —
+  he does not read or edit code himself.
+- Give simple, step-by-step instructions. Perform the task, don't explain it at length.
+  Minimal explanation — long write-ups waste his time and tokens.
+- The goal each time is the end result (a working fix, a pasted file, a clicked button),
+  not a lesson in how the code works.
+- Every path, URL, or anything to be copied must be given in a copy-paste code block,
+  no exceptions.
