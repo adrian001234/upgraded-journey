@@ -7,6 +7,7 @@ OpenAI-compatible /v1/audio/speech endpoint.
 import json
 import os
 import urllib.request
+import urllib.error
 
 FREELLM_URL = os.environ["FREELLM_API_URL"].replace("/chat/completions", "")
 FREELLM_KEY = os.environ["FREELLM_API_KEY"]
@@ -14,11 +15,10 @@ FREELLM_KEY = os.environ["FREELLM_API_KEY"]
 AUDIO_DIR = "narration/audio"
 
 
-def generate_narration_audio(text, out_path, voice="alloy"):
+def generate_narration_audio(text, out_path):
     body = json.dumps({
         "model": "auto",
         "input": text,
-        "voice": voice,
     }).encode()
     req = urllib.request.Request(
         f"{FREELLM_URL}/audio/speech",
@@ -28,8 +28,13 @@ def generate_narration_audio(text, out_path, voice="alloy"):
             "Content-Type": "application/json",
         },
     )
-    with urllib.request.urlopen(req) as resp:
-        audio_bytes = resp.read()
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            audio_bytes = resp.read()
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode(errors="replace")[:500]
+        raise RuntimeError(f"HTTP {e.code} from FreeLLMAPI audio endpoint. Body: {error_body}") from e
+
     with open(out_path, "wb") as f:
         f.write(audio_bytes)
 
