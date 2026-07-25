@@ -11,6 +11,8 @@ import urllib.request
 AGNES_URL = os.environ["AGNES_API_URL"]
 AGNES_KEY = os.environ["AGNES_API_KEY"]
 
+MAX_SCENE_RETRIES = 3
+
 
 def create_agnes_task(visual_prompt):
     body = json.dumps({
@@ -49,30 +51,42 @@ def poll_agnes_task(video_id, max_retries=20, delay=15):
     return None
 
 
+def generate_scene_clip(scene, title):
+    """Try up to MAX_SCENE_RETRIES times to generate one scene's clip."""
+    for attempt in range(1, MAX_SCENE_RETRIES + 1):
+        try:
+            video_id = create_agnes_task(scene)
+            clip_url = poll_agnes_task(video_id)
+            if clip_url:
+                return clip_url
+            print(f"  Attempt {attempt}/{MAX_SCENE_RETRIES} failed/timed out on a scene for: {title}")
+        except Exception as e:
+            print(f"  Attempt {attempt}/{MAX_SCENE_RETRIES} error on a scene for {title}: {e}")
+    return None
+
+
 def generate_videos(scripts_path="script/latest_scripts.json", out_path="video/latest_videos.json"):
     with open(scripts_path) as f:
         scripts = json.load(f)
 
     videos = []
     for s in scripts:
+        expected = len(s["scenes"])
         clip_urls = []
         for scene in s["scenes"]:
-            try:
-                video_id = create_agnes_task(scene)
-                clip_url = poll_agnes_task(video_id)
-                if clip_url:
-                    clip_urls.append(clip_url)
-                    print(f"  Generated scene clip for: {s['title']}")
-                else:
-                    print(f"  Failed/timed out on a scene for: {s['title']}")
-            except Exception as e:
-                print(f"  Error on a scene for {s['title']}: {e}")
+            clip_url = generate_scene_clip(scene, s["title"])
+            if clip_url:
+                clip_urls.append(clip_url)
+                print(f"  Generated scene clip for: {s['title']}")
+            else:
+                print(f"  Giving up on a scene for: {s['title']} after {MAX_SCENE_RETRIES} retries")
 
-        if clip_urls:
+        if len(clip_urls) == expected:
             videos.append({**s, "clip_urls": clip_urls})
-            print(f"Generated {len(clip_urls)} clips for: {s['title']}")
+            print(f"Generated {len(clip_urls)}/{expected} clips for: {s['title']}")
         else:
-            print(f"No clips generated for: {s['title']}")
+            print(f"SKIPPING '{s['title']}': only {len(clip_urls)}/{expected} scenes succeeded — "
+                  f"not sending a short/looped video to assembly")
 
     with open(out_path, "w") as f:
         json.dump(videos, f, indent=2)
