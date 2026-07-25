@@ -16,6 +16,15 @@ def download(url, out_path):
     urllib.request.urlretrieve(url, out_path)
 
 
+def get_duration(path):
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True, check=True,
+    )
+    return float(result.stdout.strip())
+
+
 def assemble_one(clip_urls, audio_path, out_path, index):
     clip_paths = []
     for i, url in enumerate(clip_urls):
@@ -37,9 +46,20 @@ def assemble_one(clip_urls, audio_path, out_path, index):
         concat_video_path,
     ], check=True)
 
+    video_duration = get_duration(concat_video_path)
+    audio_duration = get_duration(audio_path)
+
+    if video_duration + 0.5 < audio_duration:
+        # Real shortfall (missing scenes slipped through) — fail loudly
+        # instead of silently looping a partial clip to hide it.
+        raise RuntimeError(
+            f"Concatenated clips ({video_duration:.1f}s) are shorter than "
+            f"narration ({audio_duration:.1f}s) — refusing to loop-and-mask this. "
+            f"Check video stage output for missing scenes."
+        )
+
     cmd = [
         "ffmpeg", "-y",
-        "-stream_loop", "-1",
         "-i", concat_video_path,
         "-i", audio_path,
         "-c:v", "libx264",
