@@ -5,6 +5,7 @@ text-to-video API. Produces one clip per scene.
 """
 import json
 import os
+import random
 import time
 import urllib.request
 import urllib.error
@@ -13,9 +14,13 @@ KIE_KEY = os.environ["KIE_API_KEY"]
 CREATE_URL = "https://api.kie.ai/api/v1/jobs/createTask"
 STATUS_URL = "https://api.kie.ai/api/v1/jobs/recordInfo"
 
-MAX_SCENE_RETRIES = 3
+MAX_SCENE_RETRIES = 5
 SCENE_DELAY_SECONDS = 5
 RETRY_BACKOFF_BASE_SECONDS = 8
+RATE_LIMIT_BACKOFF_SECONDS = 45  # used for 429 / 503, which mean "slow down / try later"
+
+# Tracks how many scenes failed due to 429/503 in this run, across all videos
+RATE_LIMIT_FAILURE_COUNT = 0
 
 
 def create_task(prompt):
@@ -62,6 +67,7 @@ def poll_task(task_id, max_retries=20, delay=15):
 
 
 def generate_scene_clip(scene, title):
+    global RATE_LIMIT_FAILURE_COUNT
     for attempt in range(1, MAX_SCENE_RETRIES + 1):
         try:
             task_id = create_task(scene)
@@ -69,12 +75,28 @@ def generate_scene_clip(scene, title):
             if clip_url:
                 return clip_url
             print(f"  Attempt {attempt}/{MAX_SCENE_RETRIES} failed/timed out on a scene for: {title}")
+            wait = RETRY_BACKOFF_BASE_SECONDS * attempt
         except urllib.error.HTTPError as e:
-            print(f"  Attempt {attempt}/{MAX_SCENE_RETRIES} error on a scene for {title}: HTTP Error {e.code}: {e.reason}")
+            if e.code in (429, 503):
+                RATE_LIMIT_FAILURE_COUNT += 1
+                reason = "rate limited" if e.code == 429 else "Kie.ai service unavailable"
+                wait = RATE_LIMIT_BACKOFF_SECONDS * attempt + random.uniform(0, 10)
+                print(f"  Attempt {attempt}/{MAX_SCENE_RETRIES} error on a scene for {title}: "
+                      f"HTTP {e.code} ({reason}) - waiting {wait:.0f}s before retry")
+            elif e.code in (401, 402):
+                # Auth or billing problem - retrying won't help, fail fast
+                print(f"  Attempt {attempt}/{MAX_SCENE_RETRIES} error on a scene for {title}: "
+                      f"HTTP {e.code} - this means either your KIE_API_KEY is invalid (401) "
+                      f"or your Kie.ai account balance is too low (402). Check the Kie.ai dashboard.")
+                return None
+            else:
+                wait = RETRY_BACKOFF_BASE_SECONDS * attempt
+                print(f"  Attempt {attempt}/{MAX_SCENE_RETRIES} error on a scene for {title}: HTTP Error {e.code}: {e.reason}")
         except Exception as e:
+            wait = RETRY_BACKOFF_BASE_SECONDS * attempt
             print(f"  Attempt {attempt}/{MAX_SCENE_RETRIES} error on a scene for {title}: {e}")
         if attempt < MAX_SCENE_RETRIES:
-            time.sleep(RETRY_BACKOFF_BASE_SECONDS * attempt)
+            time.sleep(wait)
     return None
 
 
@@ -105,6 +127,12 @@ def generate_videos(scripts_path="script/latest_scripts.json", out_path="video/l
     with open(out_path, "w") as f:
         json.dump(videos, f, indent=2)
     print(f"Saved {len(videos)} videos to {out_path}")
+
+    if RATE_LIMIT_FAILURE_COUNT > 0:
+        print(f"\nNOTE: {RATE_LIMIT_FAILURE_COUNT} scene attempt(s) failed with 429/503 this run. "
+              f"This almost always means your Kie.ai account is low on balance/credits or Kie.ai's "
+              f"servers were temporarily down - it is not a code problem. Check "
+              f"https://kie.ai account balance before the next run.")
 
 
 if __name__ == "__main__":
