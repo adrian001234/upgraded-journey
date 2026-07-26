@@ -7,11 +7,14 @@ import json
 import os
 import time
 import urllib.request
+import urllib.error
 
 AGNES_URL = os.environ["AGNES_API_URL"]
 AGNES_KEY = os.environ["AGNES_API_KEY"]
 
 MAX_SCENE_RETRIES = 3
+SCENE_DELAY_SECONDS = 5  # pause between scenes so we don't burst Agnes and trip rate limits
+RETRY_BACKOFF_BASE_SECONDS = 8  # exponential backoff between retry attempts on the same scene
 
 
 def create_agnes_task(visual_prompt):
@@ -52,7 +55,7 @@ def poll_agnes_task(video_id, max_retries=20, delay=15):
 
 
 def generate_scene_clip(scene, title):
-    """Try up to MAX_SCENE_RETRIES times to generate one scene's clip."""
+    """Try up to MAX_SCENE_RETRIES times to generate one scene's clip, backing off between attempts."""
     for attempt in range(1, MAX_SCENE_RETRIES + 1):
         try:
             video_id = create_agnes_task(scene)
@@ -60,8 +63,14 @@ def generate_scene_clip(scene, title):
             if clip_url:
                 return clip_url
             print(f"  Attempt {attempt}/{MAX_SCENE_RETRIES} failed/timed out on a scene for: {title}")
+        except urllib.error.HTTPError as e:
+            print(f"  Attempt {attempt}/{MAX_SCENE_RETRIES} error on a scene for {title}: HTTP Error {e.code}: {e.reason}")
         except Exception as e:
             print(f"  Attempt {attempt}/{MAX_SCENE_RETRIES} error on a scene for {title}: {e}")
+
+        if attempt < MAX_SCENE_RETRIES:
+            backoff = RETRY_BACKOFF_BASE_SECONDS * attempt
+            time.sleep(backoff)
     return None
 
 
@@ -73,7 +82,9 @@ def generate_videos(scripts_path="script/latest_scripts.json", out_path="video/l
     for s in scripts:
         expected = len(s["scenes"])
         clip_urls = []
-        for scene in s["scenes"]:
+        for i, scene in enumerate(s["scenes"]):
+            if i > 0:
+                time.sleep(SCENE_DELAY_SECONDS)
             clip_url = generate_scene_clip(scene, s["title"])
             if clip_url:
                 clip_urls.append(clip_url)
