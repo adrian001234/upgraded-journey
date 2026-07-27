@@ -43,7 +43,12 @@ def create_task(prompt):
     )
     with urllib.request.urlopen(req) as resp:
         result = json.loads(resp.read())
-        return result["data"]["taskId"]
+        code = result.get("code")
+        data = result.get("data")
+        if code not in (200, None) or not data or "taskId" not in data:
+            msg = result.get("msg") or result.get("message") or "no message"
+            raise RuntimeError(f"Kie.ai rejected the task (code={code}, msg={msg}, raw={json.dumps(result)[:300]})")
+        return data["taskId"]
 
 
 def poll_task(task_id, max_retries=20, delay=15):
@@ -61,6 +66,8 @@ def poll_task(task_id, max_retries=20, delay=15):
                 urls = result_json.get("resultUrls", [])
                 return urls[0] if urls else None
             if state == "fail":
+                fail_msg = data.get("failMsg") or data.get("msg") or "no failure message provided"
+                print(f"  Kie.ai task {task_id} failed: {fail_msg}")
                 return None
         time.sleep(delay)
     return None
