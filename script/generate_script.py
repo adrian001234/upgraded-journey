@@ -10,7 +10,7 @@ import urllib.request
 import urllib.error
 
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_KEY}"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key={GEMINI_KEY}"
 
 PROMPT_TEMPLATE = """You are writing a YouTube Short for a tech/AI/science news channel.
 Headline: {title}
