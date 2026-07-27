@@ -21,10 +21,9 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
         run: python research/sources.py
-      - name: Script stage
+      - - name: Script stage
         env:
-          FREELLM_API_URL: ${{ secrets.FREELLM_API_URL }}
-          FREELLM_API_KEY: ${{ secrets.FREELLM_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python script/generate_script.py
       - name: Video stage
         env:
