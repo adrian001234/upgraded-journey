@@ -19,7 +19,7 @@ Write TWO separate things:
 1. NARRATION: A 30-40 second spoken voiceover script (90-120 words). Start with a scroll-stopping hook in the very first sentence (a bold claim, surprising number, or curiosity-gap question) — no slow lead-in. Keep every sentence short and easy to say out loud. No filler, no robotic phrasing, no repeated words. End with a punchy one-line payoff (not a generic "and that's it").
 2. SCENES: An array of exactly 7 short cinematic scene descriptions (1 sentence each) for an AI video generator, meant to play in sequence as B-roll matching the story as it unfolds — each describing camera angle, lighting, and setting. Vary the shots (don't repeat the same framing). Do NOT restate the narration word-for-word; describe what should be SEEN, not what should be SAID.
 Output strict JSON only, no other text:
-{{"narration": "...", "scenes": ["...", "...", "...", "...", "...", "...", "..."]}}"""
+{{"narration": "...", "scenes": ["...", "...", "...", "...", "...", "...", "...", "..."]}}"""
 
 
 def call_freellm(prompt):
@@ -56,6 +56,9 @@ def call_freellm(prompt):
         raise RuntimeError(f"Unexpected response shape from FreeLLMAPI (routed via {routed_via}): {json.dumps(result)[:500]}") from e
     if not content or not content.strip():
         raise RuntimeError(f"FreeLLMAPI returned an empty completion (routed via {routed_via}). The model it picked gave back nothing.")
+    print(f"=== RAW FREELLM OUTPUT (routed via {routed_via}) ===")
+    print(content.strip())
+    print("=== END RAW FREELLM OUTPUT ===")
     return content.strip()
 
 
