@@ -13,7 +13,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install dependencies
-        run: pip install feedparser google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
+        run: pip install feedparser google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2 gTTS
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Research stage
@@ -30,9 +30,6 @@ jobs:
           KIE_API_KEY: ${{ secrets.KIE_API_KEY }}
         run: python video/generate_video.py
       - name: Narration stage
-        env:
-          FREELLM_API_URL: ${{ secrets.FREELLM_API_URL }}
-          FREELLM_API_KEY: ${{ secrets.FREELLM_API_KEY }}
         run: python narration/generate_narration.py
       - name: Assembly stage
         run: python assembly/assemble.py
