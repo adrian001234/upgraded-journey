@@ -34,12 +34,16 @@ def sync_videos(videos_path="video/latest_videos.json"):
     count = 0
     for v in videos:
         try:
+            # No final assembled video exists yet at this stage - only the
+            # individual scene clip_urls. video_url is nullable, so we
+            # leave it unset here rather than referencing a key that
+            # doesn't exist on this stage's data (was causing every
+            # insert to silently fail with a KeyError).
             insert_video({
                 "title": v["title"],
                 "source": v["source"],
                 "link": v["link"],
                 "script": v.get("narration", ""),
-                "video_url": v["video_url"],
                 "status": "video_generated",
             })
             count += 1
