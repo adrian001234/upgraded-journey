@@ -14,6 +14,9 @@ KIE_KEY = os.environ["KIE_API_KEY"]
 CREATE_URL = "https://api.kie.ai/api/v1/jobs/createTask"
 STATUS_URL = "https://api.kie.ai/api/v1/jobs/recordInfo"
 
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
+
 MAX_SCENE_RETRIES = 5
 SCENE_DELAY_SECONDS = 5
 RETRY_BACKOFF_BASE_SECONDS = 8
@@ -28,6 +31,31 @@ DARK_SCENE_KEYWORDS = (
     "night", "nighttime", "dark", "dim", "shadow", "shadowy",
     "moonlit", "midnight", "dusk", "candlelit", "silhouette",
 )
+
+
+def log_debug(stage, message):
+    """Best-effort write of a diagnostic line to Supabase pipeline_debug,
+    so failures are visible without needing GitHub Actions log access.
+    Never raises - a logging failure must not break the pipeline."""
+    print(f"  [debug] {stage}: {message}")
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+        return
+    try:
+        body = json.dumps({"stage": stage, "message": str(message)[:2000]}).encode()
+        req = urllib.request.Request(
+            f"{SUPABASE_URL}/rest/v1/pipeline_debug",
+            data=body,
+            method="POST",
+            headers={
+                "apikey": SUPABASE_ANON_KEY,
+                "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            },
+        )
+        urllib.request.urlopen(req, timeout=15)
+    except Exception:
+        pass
 
 
 def build_video_prompt(scene):
@@ -76,9 +104,6 @@ def create_task(prompt):
     except RuntimeError:
         raise
     except Exception as e:
-        # The response didn't have the shape we expected (e.g. "data" was
-        # present but null). Surface the raw body instead of a bare
-        # Python TypeError so the actual API response is visible in logs.
         raise RuntimeError(f"Kie.ai createTask response wasn't in the expected shape ({e}). Raw body: {raw[:500]!r}") from e
 
 
@@ -101,11 +126,14 @@ def poll_task(task_id, max_retries=20, delay=15):
             if state == "fail":
                 fail_msg = data.get("failMsg") or data.get("msg") or "no failure message provided"
                 print(f"  Kie.ai task {task_id} failed: {fail_msg}")
+                log_debug("video", f"Kie.ai task {task_id} state=fail: {fail_msg}")
                 return None
         except Exception as e:
             print(f"  Kie.ai poll response for task {task_id} wasn't in the expected shape ({e}). Raw body: {raw[:500]!r}")
+            log_debug("video", f"poll_task bad response shape for {task_id}: {e}. Raw: {raw[:300]!r}")
             return None
         time.sleep(delay)
+    log_debug("video", f"poll_task timed out after {max_retries} retries for task {task_id}")
     return None
 
 
@@ -115,69 +143,4 @@ def generate_scene_clip(scene, title):
     for attempt in range(1, MAX_SCENE_RETRIES + 1):
         try:
             task_id = create_task(prompt)
-            clip_url = poll_task(task_id)
-            if clip_url:
-                return clip_url
-            print(f"  Attempt {attempt}/{MAX_SCENE_RETRIES} failed/timed out on a scene for: {title}")
-            wait = RETRY_BACKOFF_BASE_SECONDS * attempt
-        except urllib.error.HTTPError as e:
-            if e.code in (429, 503):
-                RATE_LIMIT_FAILURE_COUNT += 1
-                reason = "rate limited" if e.code == 429 else "Kie.ai service unavailable"
-                wait = RATE_LIMIT_BACKOFF_SECONDS * attempt + random.uniform(0, 10)
-                print(f"  Attempt {attempt}/{MAX_SCENE_RETRIES} error on a scene for {title}: "
-                      f"HTTP {e.code} ({reason}) - waiting {wait:.0f}s before retry")
-            elif e.code in (401, 402):
-                # Auth or billing problem - retrying won't help, fail fast
-                print(f"  Attempt {attempt}/{MAX_SCENE_RETRIES} error on a scene for {title}: "
-                      f"HTTP {e.code} - this means either your KIE_API_KEY is invalid (401) "
-                      f"or your Kie.ai account balance is too low (402). Check the Kie.ai dashboard.")
-                return None
-            else:
-                wait = RETRY_BACKOFF_BASE_SECONDS * attempt
-                print(f"  Attempt {attempt}/{MAX_SCENE_RETRIES} error on a scene for {title}: HTTP Error {e.code}: {e.reason}")
-        except Exception as e:
-            wait = RETRY_BACKOFF_BASE_SECONDS * attempt
-            print(f"  Attempt {attempt}/{MAX_SCENE_RETRIES} error on a scene for {title}: {e}")
-        if attempt < MAX_SCENE_RETRIES:
-            time.sleep(wait)
-    return None
-
-
-def generate_videos(scripts_path="script/latest_scripts.json", out_path="video/latest_videos.json"):
-    with open(scripts_path) as f:
-        scripts = json.load(f)
-
-    videos = []
-    for s in scripts:
-        expected = len(s["scenes"])
-        clip_urls = []
-        for i, scene in enumerate(s["scenes"]):
-            if i > 0:
-                time.sleep(SCENE_DELAY_SECONDS)
-            clip_url = generate_scene_clip(scene, s["title"])
-            if clip_url:
-                clip_urls.append(clip_url)
-                print(f"  Generated scene clip for: {s['title']}")
-            else:
-                print(f"  Giving up on a scene for: {s['title']} after {MAX_SCENE_RETRIES} retries")
-
-        if len(clip_urls) == expected:
-            videos.append({**s, "clip_urls": clip_urls})
-            print(f"Generated {len(clip_urls)}/{expected} clips for: {s['title']}")
-        else:
-            print(f"SKIPPING '{s['title']}': only {len(clip_urls)}/{expected} scenes succeeded")
-
-    with open(out_path, "w") as f:
-        json.dump(videos, f, indent=2)
-    print(f"Saved {len(videos)} videos to {out_path}")
-
-    if RATE_LIMIT_FAILURE_COUNT > 0:
-        print(f"\nNOTE: {RATE_LIMIT_FAILURE_COUNT} scene attempt(s) failed with 429/503 this run. "
-              f"This almost always means your Kie.ai account is low on balance/credits or Kie.ai's "
-              f"servers were temporarily down - it is not a code problem. Check "
-              f"https://kie.ai account balance before the next run.")
-
-
-if __name__ == "__main__":
-    generate_videos()
+            clip_url =
