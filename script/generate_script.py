@@ -17,7 +17,14 @@ Headline: {title}
 Summary: {summary}
 Write TWO separate things:
 1. NARRATION: A 30-40 second spoken voiceover script (90-120 words). Start with a scroll-stopping hook in the very first sentence (a bold claim, surprising number, or curiosity-gap question) — no slow lead-in. Keep every sentence short and easy to say out loud. No filler, no robotic phrasing, no repeated words. End with a punchy one-line payoff (not a generic "and that's it").
-2. SCENES: An array of exactly 7 short cinematic scene descriptions (1 sentence each) for an AI video generator, meant to play in sequence as B-roll matching the story as it unfolds — each describing camera angle, lighting, and setting. Vary the shots (don't repeat the same framing). Do NOT restate the narration word-for-word; describe what should be SEEN, not what should be SAID.
+2. SCENES: An array of exactly 7 short cinematic scene descriptions for an AI video generator, meant to play in sequence as B-roll matching the story as it unfolds — each describing camera angle, lighting, and setting. Vary the shots (don't repeat the same framing). Do NOT restate the narration word-for-word; describe what should be SEEN, not what should be SAID.
+
+CRITICAL consistency rules — the video generator has NO memory between scenes, so every scene description must be fully self-contained and repeat the same fixed details in full, every time:
+- Pick ONE real-world setting (country/city/company/location) strictly from what the headline and summary actually describe. Do not invent or drift to an unrelated location, and do not add institutions, uniforms, flags, or military/national symbols that are not actually part of the story.
+- If a recurring person appears, invent ONE fixed physical description the first time (approximate age, gender, one or two distinguishing features) and then repeat that EXACT description word-for-word in every scene they appear in. Never let age, gender, or appearance drift between scenes.
+- Avoid close-up shots of hands operating small precise objects (dials, switches, buttons, keyboards) — AI video generators render fine hand-object interaction unreliably. Favor wider shots of the person, the object on its own, or the environment instead.
+- Every scene must be clearly, brightly lit (natural daylight or bright interior lighting) and state this explicitly, UNLESS the story specifically requires darkness or nighttime — in which case say so explicitly instead.
+
 Output strict JSON only, no other text:
 {{"narration": "...", "scenes": ["...", "...", "...", "...", "...", "...", "..."]}}"""
 
