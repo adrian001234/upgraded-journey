@@ -22,6 +22,28 @@ RATE_LIMIT_BACKOFF_SECONDS = 45  # used for 429 / 503, which mean "slow down / t
 # Tracks how many scenes failed due to 429/503 in this run, across all videos
 RATE_LIMIT_FAILURE_COUNT = 0
 
+# Scene text containing any of these words is treated as an intentionally
+# dark/night shot and is left alone instead of being forced bright.
+DARK_SCENE_KEYWORDS = (
+    "night", "nighttime", "dark", "dim", "shadow", "shadowy",
+    "moonlit", "midnight", "dusk", "candlelit", "silhouette",
+)
+
+
+def build_video_prompt(scene):
+    """Prepend a strong, front-loaded lighting cue to every scene prompt.
+    Text-to-video models weight earlier tokens more heavily, so the
+    lighting instruction goes FIRST, not appended at the end."""
+    is_intentionally_dark = any(word in scene.lower() for word in DARK_SCENE_KEYWORDS)
+    if is_intentionally_dark:
+        lighting_cue = "Moody, intentionally low-light scene as part of the story. "
+    else:
+        lighting_cue = (
+            "Brightly and evenly lit scene, strong natural daylight or bright "
+            "clean interior lighting, no underexposure, no murky shadows. "
+        )
+    return lighting_cue + scene
+
 
 def create_task(prompt):
     body = json.dumps({
@@ -42,13 +64,22 @@ def create_task(prompt):
         },
     )
     with urllib.request.urlopen(req) as resp:
-        result = json.loads(resp.read())
+        raw = resp.read()
+    try:
+        result = json.loads(raw)
         code = result.get("code")
-        data = result.get("data")
+        data = result.get("data") or {}
         if code not in (200, None) or not data or "taskId" not in data:
             msg = result.get("msg") or result.get("message") or "no message"
             raise RuntimeError(f"Kie.ai rejected the task (code={code}, msg={msg}, raw={json.dumps(result)[:300]})")
         return data["taskId"]
+    except RuntimeError:
+        raise
+    except Exception as e:
+        # The response didn't have the shape we expected (e.g. "data" was
+        # present but null). Surface the raw body instead of a bare
+        # Python TypeError so the actual API response is visible in logs.
+        raise RuntimeError(f"Kie.ai createTask response wasn't in the expected shape ({e}). Raw body: {raw[:500]!r}") from e
 
 
 def poll_task(task_id, max_retries=20, delay=15):
@@ -58,26 +89,32 @@ def poll_task(task_id, max_retries=20, delay=15):
             headers={"Authorization": f"Bearer {KIE_KEY}"},
         )
         with urllib.request.urlopen(req) as resp:
-            result = json.loads(resp.read())
-            data = result.get("data", {})
+            raw = resp.read()
+        try:
+            result = json.loads(raw)
+            data = result.get("data") or {}
             state = data.get("state")
             if state == "success":
-                result_json = json.loads(data.get("resultJson", "{}"))
+                result_json = json.loads(data.get("resultJson") or "{}")
                 urls = result_json.get("resultUrls", [])
                 return urls[0] if urls else None
             if state == "fail":
                 fail_msg = data.get("failMsg") or data.get("msg") or "no failure message provided"
                 print(f"  Kie.ai task {task_id} failed: {fail_msg}")
                 return None
+        except Exception as e:
+            print(f"  Kie.ai poll response for task {task_id} wasn't in the expected shape ({e}). Raw body: {raw[:500]!r}")
+            return None
         time.sleep(delay)
     return None
 
 
 def generate_scene_clip(scene, title):
     global RATE_LIMIT_FAILURE_COUNT
+    prompt = build_video_prompt(scene)
     for attempt in range(1, MAX_SCENE_RETRIES + 1):
         try:
-            task_id = create_task(scene)
+            task_id = create_task(prompt)
             clip_url = poll_task(task_id)
             if clip_url:
                 return clip_url
