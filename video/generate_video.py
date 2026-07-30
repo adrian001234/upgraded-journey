@@ -1,32 +1,34 @@
 """
 TechPulse - Video Stage
-Sends each scene's visual description to Kie.ai's HappyHorse-1.1
-text-to-video API. Produces one clip per scene.
+Generates one still image per scene using Pollinations (free, no API key,
+no billing). Assembly stage animates each image with a pan/zoom effect
+to build the final video, so no paid text-to-video model is needed.
 """
 import json
 import os
-import random
 import time
 import urllib.request
 import urllib.error
-
-KIE_KEY = os.environ["KIE_API_KEY"]
-CREATE_URL = "https://api.kie.ai/api/v1/jobs/createTask"
-STATUS_URL = "https://api.kie.ai/api/v1/jobs/recordInfo"
+import urllib.parse
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
 
-MAX_SCENE_RETRIES = 5
-SCENE_DELAY_SECONDS = 5
-RETRY_BACKOFF_BASE_SECONDS = 8
-RATE_LIMIT_BACKOFF_SECONDS = 45  # used for 429 / 503, which mean "slow down / try later"
+IMAGE_BASE_URL = "https://image.pollinations.ai/prompt/"
+IMAGE_WIDTH = 1280
+IMAGE_HEIGHT = 720
 
-# Tracks how many scenes failed due to 429/503 in this run, across all videos
-RATE_LIMIT_FAILURE_COUNT = 0
+MAX_SCENE_RETRIES = 4
+SCENE_DELAY_SECONDS = 16  # Pollinations' anonymous tier is rate-capped to ~1 req/15s
+RETRY_BACKOFF_BASE_SECONDS = 10
 
-# Scene text containing any of these words is treated as an intentionally
-# dark/night shot and is left alone instead of being forced bright.
+# Front-loaded style cue applied to every scene. Change this one string to
+# switch the whole channel's visual identity.
+STYLE_CUE = (
+    "Flat 2D vector motion-graphic illustration, clean flat colors, "
+    "bold simple shapes, no photorealism, no live-action, no 3D render. "
+)
+
 DARK_SCENE_KEYWORDS = (
     "night", "nighttime", "dark", "dim", "shadow", "shadowy",
     "moonlit", "midnight", "dusk", "candlelit", "silhouette",
@@ -58,155 +60,90 @@ def log_debug(stage, message):
         pass
 
 
-def build_video_prompt(scene):
-    """Prepend a strong, front-loaded lighting cue to every scene prompt.
-    Text-to-video models weight earlier tokens more heavily, so the
-    lighting instruction goes FIRST, not appended at the end."""
+def build_image_prompt(scene):
+    """Prepend a strong, front-loaded style + lighting cue to every scene
+    prompt. Front-loading matters because prompt weighting favors earlier
+    tokens."""
     is_intentionally_dark = any(word in scene.lower() for word in DARK_SCENE_KEYWORDS)
     if is_intentionally_dark:
         lighting_cue = "Moody, intentionally low-light scene as part of the story. "
     else:
         lighting_cue = (
-            "Brightly and evenly lit scene, strong natural daylight or bright "
-            "clean interior lighting, no underexposure, no murky shadows. "
+            "Brightly and evenly lit scene, no underexposure, no murky shadows. "
         )
-    return lighting_cue + scene
+    return STYLE_CUE + lighting_cue + scene
 
 
-def create_task(prompt):
-    body = json.dumps({
-        "model": "happyhorse-1-1/text-to-video",
-        "input": {
-            "prompt": prompt,
-            "resolution": "720p",
-            "aspect_ratio": "16:9",
-            "duration": 5,
-        },
-    }).encode()
-    req = urllib.request.Request(
-        CREATE_URL,
-        data=body,
-        headers={
-            "Authorization": f"Bearer {KIE_KEY}",
-            "Content-Type": "application/json",
-        },
+def fetch_image(prompt, out_path, seed):
+    encoded = urllib.parse.quote(prompt, safe="")
+    url = (
+        f"{IMAGE_BASE_URL}{encoded}"
+        f"?width={IMAGE_WIDTH}&height={IMAGE_HEIGHT}&seed={seed}&nologo=true"
     )
-    with urllib.request.urlopen(req) as resp:
-        raw = resp.read()
-    try:
-        result = json.loads(raw)
-        code = result.get("code")
-        data = result.get("data") or {}
-        if code not in (200, None) or not data or "taskId" not in data:
-            msg = result.get("msg") or result.get("message") or "no message"
-            raise RuntimeError(f"Kie.ai rejected the task (code={code}, msg={msg}, raw={json.dumps(result)[:300]})")
-        return data["taskId"]
-    except RuntimeError:
-        raise
-    except Exception as e:
-        raise RuntimeError(f"Kie.ai createTask response wasn't in the expected shape ({e}). Raw body: {raw[:500]!r}") from e
+    req = urllib.request.Request(url, headers={"User-Agent": "TechPulse/1.0"})
+    with urllib.request.urlopen(req, timeout=90) as resp:
+        data = resp.read()
+    if len(data) < 1000:
+        # Pollinations returns a tiny error/placeholder image on failure
+        # rather than an HTTP error status in some cases.
+        raise RuntimeError(f"Pollinations returned a suspiciously small image ({len(data)} bytes)")
+    with open(out_path, "wb") as f:
+        f.write(data)
 
 
-def poll_task(task_id, max_retries=20, delay=15):
-    for _ in range(max_retries):
-        req = urllib.request.Request(
-            f"{STATUS_URL}?taskId={task_id}",
-            headers={"Authorization": f"Bearer {KIE_KEY}"},
-        )
-        with urllib.request.urlopen(req) as resp:
-            raw = resp.read()
-        try:
-            result = json.loads(raw)
-            data = result.get("data") or {}
-            state = data.get("state")
-            if state == "success":
-                result_json = json.loads(data.get("resultJson") or "{}")
-                urls = result_json.get("resultUrls", [])
-                return urls[0] if urls else None
-            if state == "fail":
-                fail_msg = data.get("failMsg") or data.get("msg") or "no failure message provided"
-                print(f"  Kie.ai task {task_id} failed: {fail_msg}")
-                log_debug("video", f"Kie.ai task {task_id} state=fail: {fail_msg}")
-                return None
-        except Exception as e:
-            print(f"  Kie.ai poll response for task {task_id} wasn't in the expected shape ({e}). Raw body: {raw[:500]!r}")
-            log_debug("video", f"poll_task bad response shape for {task_id}: {e}. Raw: {raw[:300]!r}")
-            return None
-        time.sleep(delay)
-    log_debug("video", f"poll_task timed out after {max_retries} retries for task {task_id}")
-    return None
-
-
-def generate_scene_clip(scene, title):
-    global RATE_LIMIT_FAILURE_COUNT
-    prompt = build_video_prompt(scene)
+def generate_scene_image(scene, title, out_path, seed):
+    prompt = build_image_prompt(scene)
     for attempt in range(1, MAX_SCENE_RETRIES + 1):
         try:
-            task_id = create_task(prompt)
-            clip_url = poll_task(task_id)
-            if clip_url:
-                return clip_url
-            print(f"  Attempt {attempt}/{MAX_SCENE_RETRIES} failed/timed out on a scene for: {title}")
-            wait = RETRY_BACKOFF_BASE_SECONDS * attempt
+            fetch_image(prompt, out_path, seed)
+            return True
         except urllib.error.HTTPError as e:
-            if e.code in (429, 503):
-                RATE_LIMIT_FAILURE_COUNT += 1
-                reason = "rate limited" if e.code == 429 else "Kie.ai service unavailable"
-                wait = RATE_LIMIT_BACKOFF_SECONDS * attempt + random.uniform(0, 10)
-                print(f"  Attempt {attempt}/{MAX_SCENE_RETRIES} error on a scene for {title}: "
-                      f"HTTP {e.code} ({reason}) - waiting {wait:.0f}s before retry")
-            elif e.code in (401, 402):
-                print(f"  Attempt {attempt}/{MAX_SCENE_RETRIES} error on a scene for {title}: "
-                      f"HTTP {e.code} - this usually means your KIE_API_KEY is invalid (401) "
-                      f"or your Kie.ai account balance is too low (402). Check the Kie.ai dashboard.")
-                log_debug("video", f"HTTP {e.code} for {title} - invalid key or low balance")
-                return None
-            else:
-                wait = RETRY_BACKOFF_BASE_SECONDS * attempt
-                print(f"  Attempt {attempt}/{MAX_SCENE_RETRIES} error on a scene for {title}: HTTP Error {e.code}: {e.reason}")
+            wait = RETRY_BACKOFF_BASE_SECONDS * attempt
+            print(f"  Attempt {attempt}/{MAX_SCENE_RETRIES} error on a scene for {title}: HTTP {e.code}")
+            log_debug("video", f"HTTP {e.code} for {title} scene image, attempt {attempt}")
         except Exception as e:
             wait = RETRY_BACKOFF_BASE_SECONDS * attempt
             print(f"  Attempt {attempt}/{MAX_SCENE_RETRIES} error on a scene for {title}: {e}")
             log_debug("video", f"Attempt {attempt} exception for {title}: {e}")
         if attempt < MAX_SCENE_RETRIES:
             time.sleep(wait)
-    return None
+    return False
 
 
 def generate_videos(scripts_path="script/latest_scripts.json", out_path="video/latest_videos.json"):
+    """Kept the name generate_videos()/latest_videos.json so pipeline.yml
+    and downstream stages don't need to change - the output now contains
+    image_urls (local file paths) instead of clip_urls."""
     with open(scripts_path) as f:
         scripts = json.load(f)
 
+    os.makedirs("video/images", exist_ok=True)
     videos = []
-    for s in scripts:
+    for s_idx, s in enumerate(scripts):
         expected = len(s["scenes"])
-        clip_urls = []
+        image_paths = []
         for i, scene in enumerate(s["scenes"]):
             if i > 0:
                 time.sleep(SCENE_DELAY_SECONDS)
-            clip_url = generate_scene_clip(scene, s["title"])
-            if clip_url:
-                clip_urls.append(clip_url)
-                print(f"  Generated scene clip for: {s['title']}")
+            out_path = f"video/images/scene_{s_idx}_{i}.jpg"
+            seed = abs(hash((s["title"], i))) % 1_000_000
+            ok = generate_scene_image(scene, s["title"], out_path, seed)
+            if ok:
+                image_paths.append(out_path)
+                print(f"  Generated scene image for: {s['title']}")
             else:
                 print(f"  Giving up on a scene for: {s['title']} after {MAX_SCENE_RETRIES} retries")
 
-        if len(clip_urls) == expected:
-            videos.append({**s, "clip_urls": clip_urls})
-            print(f"Generated {len(clip_urls)}/{expected} clips for: {s['title']}")
+        if len(image_paths) == expected:
+            videos.append({**s, "image_urls": image_paths})
+            print(f"Generated {len(image_paths)}/{expected} images for: {s['title']}")
         else:
-            print(f"SKIPPING '{s['title']}': only {len(clip_urls)}/{expected} scenes succeeded")
-            log_debug("video", f"SKIPPING '{s['title']}': only {len(clip_urls)}/{expected} scenes succeeded")
+            print(f"SKIPPING '{s['title']}': only {len(image_paths)}/{expected} scenes succeeded")
+            log_debug("video", f"SKIPPING '{s['title']}': only {len(image_paths)}/{expected} scenes succeeded")
 
     with open(out_path, "w") as f:
         json.dump(videos, f, indent=2)
     print(f"Saved {len(videos)} videos to {out_path}")
-
-    if RATE_LIMIT_FAILURE_COUNT > 0:
-        print(f"\nNOTE: {RATE_LIMIT_FAILURE_COUNT} scene attempt(s) failed with 429/503 this run. "
-              f"This almost always means your Kie.ai account is low on balance/credits or Kie.ai's "
-              f"servers were temporarily down - it is not a code problem. Check "
-              f"https://kie.ai account balance before the next run.")
 
 
 if __name__ == "__main__":
