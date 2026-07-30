@@ -26,8 +26,6 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python script/generate_script.py
       - name: Video stage
-        env:
-          KIE_API_KEY: ${{ secrets.KIE_API_KEY }}
         run: python video/generate_video.py
       - name: Narration stage
         run: python narration/generate_narration.py
