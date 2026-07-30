@@ -35,7 +35,7 @@ def upload_video(youtube, item):
             "description": item.get("narration", "")[:4900],
             "categoryId": "28",
         },
-        "status": {"privacyStatus": "unlisted"},
+        "status": {"privacyStatus": "public"},
     }
     media = MediaFileUpload(item["final_path"], resumable=True)
     request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
