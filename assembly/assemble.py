@@ -1,19 +1,18 @@
 """
 TechPulse - Assembly Stage
-Downloads all scene clips for each script, concatenates them in order,
-muxes the result with the narration audio, outputs a final MP4.
+Takes the still images from the Video stage and animates each one with a
+slow pan/zoom (Ken Burns effect), sized to fill an even share of the
+narration's length, then concatenates and muxes with the narration audio.
 """
 import json
 import os
 import subprocess
-import urllib.request
 
 FINAL_DIR = "assembly/final"
 TMP_DIR = "assembly/tmp"
 
-
-def download(url, out_path):
-    urllib.request.urlretrieve(url, out_path)
+FPS = 30
+ZOOM_PER_FRAME = 0.0012  # slow, subtle zoom - avoid a seasick effect
 
 
 def get_duration(path):
@@ -25,11 +24,32 @@ def get_duration(path):
     return float(result.stdout.strip())
 
 
-def assemble_one(clip_urls, audio_path, out_path, index):
+def animate_image(image_path, out_path, duration_seconds):
+    frames = max(int(duration_seconds * FPS), 1)
+    zoompan = (
+        f"zoompan=z='min(zoom+{ZOOM_PER_FRAME},1.4)':"
+        f"d={frames}:s=1280x720:fps={FPS}"
+    )
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-loop", "1",
+        "-i", image_path,
+        "-vf", zoompan,
+        "-t", str(duration_seconds),
+        "-pix_fmt", "yuv420p",
+        "-c:v", "libx264",
+        out_path,
+    ], check=True)
+
+
+def assemble_one(image_paths, audio_path, out_path, index):
+    audio_duration = get_duration(audio_path)
+    segment_duration = audio_duration / len(image_paths)
+
     clip_paths = []
-    for i, url in enumerate(clip_urls):
+    for i, img in enumerate(image_paths):
         clip_path = f"{TMP_DIR}/clip_{index}_{i}.mp4"
-        download(url, clip_path)
+        animate_image(img, clip_path, segment_duration)
         clip_paths.append(clip_path)
 
     concat_list_path = f"{TMP_DIR}/concat_{index}.txt"
@@ -42,21 +62,9 @@ def assemble_one(clip_urls, audio_path, out_path, index):
         "ffmpeg", "-y",
         "-f", "concat", "-safe", "0",
         "-i", concat_list_path,
-        "-c", "libx264",
+        "-c", "copy",
         concat_video_path,
     ], check=True)
-
-    video_duration = get_duration(concat_video_path)
-    audio_duration = get_duration(audio_path)
-
-    if video_duration + 0.5 < audio_duration:
-        # Real shortfall (missing scenes slipped through) — fail loudly
-        # instead of silently looping a partial clip to hide it.
-        raise RuntimeError(
-            f"Concatenated clips ({video_duration:.1f}s) are shorter than "
-            f"narration ({audio_duration:.1f}s) — refusing to loop-and-mask this. "
-            f"Check video stage output for missing scenes."
-        )
 
     cmd = [
         "ffmpeg", "-y",
@@ -87,7 +95,7 @@ def assemble_all(narrations_path="narration/latest_narrations.json", out_path="a
     for i, item in enumerate(items):
         final_path = f"{FINAL_DIR}/final_{i}.mp4"
         try:
-            assemble_one(item["clip_urls"], item["audio_path"], final_path, i)
+            assemble_one(item["image_urls"], item["audio_path"], final_path, i)
             results.append({**item, "final_path": final_path})
             print(f"Assembled: {item['title']}")
         except Exception as e:
