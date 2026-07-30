@@ -125,11 +125,11 @@ def generate_videos(scripts_path="script/latest_scripts.json", out_path="video/l
         for i, scene in enumerate(s["scenes"]):
             if i > 0:
                 time.sleep(SCENE_DELAY_SECONDS)
-            out_path = f"video/images/scene_{s_idx}_{i}.jpg"
+            image_out_path = f"video/images/scene_{s_idx}_{i}.jpg"
             seed = abs(hash((s["title"], i))) % 1_000_000
-            ok = generate_scene_image(scene, s["title"], out_path, seed)
+            ok = generate_scene_image(scene, s["title"], image_out_path, seed)
             if ok:
-                image_paths.append(out_path)
+                image_paths.append(image_out_path)
                 print(f"  Generated scene image for: {s['title']}")
             else:
                 print(f"  Giving up on a scene for: {s['title']} after {MAX_SCENE_RETRIES} retries")
