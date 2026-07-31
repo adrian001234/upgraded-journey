@@ -13,7 +13,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install dependencies
-       run: pip install feedparser google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2 edge-tts
+        run: pip install feedparser google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2 edge-tts
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Research stage
@@ -26,6 +26,8 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python script/generate_script.py
       - name: Video stage
+        env:
+          AGNES_API_KEY: ${{ secrets.AGNES_API_KEY }}
         run: python video/generate_video.py
       - name: Narration stage
         run: python narration/generate_narration.py
