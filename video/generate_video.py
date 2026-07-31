@@ -1,12 +1,14 @@
 """
 TechPulse - Video Stage
-Generates one real AI video clip per scene via Agnes AI (agnes-video-v2.0),
-anchored image-to-video for consistency: scene 0 uses a one-time character/
-scene reference image (agnes-image-2.1-flash) built from the episode's own
-first scene description; every scene after that anchors to the last frame
-of the previous scene's own clip. Replaces the earlier Pollinations-still-
-image + Ken-Burns approach with real motion and consistent visuals across
-scenes - same architecture as the Marius/Erased channel pipeline.
+Generates one real AI video clip per scene via Agnes AI (agnes-video-v2.0).
+For stories with a genuine recurring person (has_recurring_person=true),
+uses image-to-video anchoring for character/scene continuity: scene 0 builds
+a one-time character reference image, and every scene after anchors to the
+last frame of the previous scene's clip - same architecture as Marius/Erased.
+For abstract/data-driven stories (has_recurring_person=false), NO character
+reference or cross-scene anchoring is used at all - each scene generates
+independently from its own text so shots vary instead of locking onto one
+invented, static figure for the whole video.
 """
 import json
 import os
@@ -208,13 +210,18 @@ def generate_videos(scripts_path="script/latest_scripts.json", out_path="video/l
     for s_idx, s in enumerate(scripts):
         scenes = s["scenes"]
         clip_paths = []
+        has_person = bool(s.get("has_recurring_person", False))
 
-        ref_path = f"video/clips/ref_{s_idx}.png"
-        anchor_url = generate_character_reference(scenes[0], ref_path)
-        if anchor_url:
-            print(f"  Character reference ready for: {s['title']}")
+        anchor_url = None
+        if has_person:
+            ref_path = f"video/clips/ref_{s_idx}.png"
+            anchor_url = generate_character_reference(scenes[0], ref_path)
+            if anchor_url:
+                print(f"  Character reference ready for: {s['title']}")
+            else:
+                print(f"  No character reference for: {s['title']} - first scene will generate blind.")
         else:
-            print(f"  No character reference for: {s['title']} - first scene will generate blind.")
+            print(f"  No recurring person for: {s['title']} - scenes will generate independently, no anchor chain.")
 
         for i, scene in enumerate(scenes):
             clip_path = f"video/clips/clip_{s_idx}_{i}.mp4"
@@ -223,16 +230,18 @@ def generate_videos(scripts_path="script/latest_scripts.json", out_path="video/l
                 print(f"  Giving up on scene {i} for: {s['title']}")
                 break
             clip_paths.append(clip_path)
-            try:
-                last_frame_png = f"video/clips/lastframe_{s_idx}_{i}.png"
-                extract_last_frame(clip_path, last_frame_png)
-                new_anchor = upload_to_tmpfiles(last_frame_png)
-                if new_anchor:
-                    anchor_url = new_anchor
-                if os.path.exists(last_frame_png):
-                    os.remove(last_frame_png)
-            except Exception as e:
-                print(f"  Could not extract continuity anchor from scene {i}, next scene generates blind: {e}")
+
+            if has_person:
+                try:
+                    last_frame_png = f"video/clips/lastframe_{s_idx}_{i}.png"
+                    extract_last_frame(clip_path, last_frame_png)
+                    new_anchor = upload_to_tmpfiles(last_frame_png)
+                    if new_anchor:
+                        anchor_url = new_anchor
+                    if os.path.exists(last_frame_png):
+                        os.remove(last_frame_png)
+                except Exception as e:
+                    print(f"  Could not extract continuity anchor from scene {i}, next scene generates blind: {e}")
 
         if len(clip_paths) == len(scenes):
             videos.append({**s, "video_urls": clip_paths})
