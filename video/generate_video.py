@@ -1,145 +1,244 @@
 """
 TechPulse - Video Stage
-Generates one still image per scene using Pollinations (free, no API key,
-no billing). Assembly stage animates each image with a pan/zoom effect
-to build the final video, so no paid text-to-video model is needed.
+Generates one real AI video clip per scene via Agnes AI (agnes-video-v2.0),
+anchored image-to-video for consistency: scene 0 uses a one-time character/
+scene reference image (agnes-image-2.1-flash) built from the episode's own
+first scene description; every scene after that anchors to the last frame
+of the previous scene's own clip. Replaces the earlier Pollinations-still-
+image + Ken-Burns approach with real motion and consistent visuals across
+scenes - same architecture as the Marius/Erased channel pipeline.
 """
 import json
 import os
 import time
+import subprocess
 import urllib.request
 import urllib.error
-import urllib.parse
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
+AGNES_API_KEY = os.environ["AGNES_API_KEY"]
+AGNES_BASE = "https://apihub.agnes-ai.com/v1"
+AGNES_POLL_URL = "https://apihub.agnes-ai.com/agnesapi"
+AGNES_IMAGE_URL = f"{AGNES_BASE}/images/generations"
 
-IMAGE_BASE_URL = "https://image.pollinations.ai/prompt/"
-IMAGE_WIDTH = 1280
-IMAGE_HEIGHT = 720
+WIDTH, HEIGHT = 1280, 720
+FRAME_RATE = 24
+MIN_FRAMES = 49
+MAX_FRAMES = 169
+CLIP_SECONDS = 5.0  # per-scene target; Assembly stage trims/extends to the real per-segment duration
 
-MAX_SCENE_RETRIES = 4
-SCENE_DELAY_SECONDS = 16  # Pollinations' anonymous tier is rate-capped to ~1 req/15s
-RETRY_BACKOFF_BASE_SECONDS = 10
+MAX_SCENE_RETRIES = 3
+AGNES_RETRYABLE = {429, 500, 502, 503, 504}
+RETRY_BACKOFF_BASE = 15
 
-# Front-loaded style cue applied to every scene. Change this one string to
-# switch the whole channel's visual identity.
-STYLE_CUE = (
-    "Flat 2D vector motion-graphic illustration, clean flat colors, "
-    "bold simple shapes, no photorealism, no live-action, no 3D render. "
-)
-
-DARK_SCENE_KEYWORDS = (
-    "night", "nighttime", "dark", "dim", "shadow", "shadowy",
-    "moonlit", "midnight", "dusk", "candlelit", "silhouette",
-)
+QUALITY_GUARD = ("shot on film, natural film grain, vivid saturated color, no sepia tone, "
+                  "no muted documentary color grading, no artificial CGI look")
+LIGHTING_CUE_BRIGHT = "bright natural daylight, high-key lighting, well-exposed, vivid colors"
+DARK_SCENE_KEYWORDS = ("night", "dark", "dim", "shadow", "dusk", "candlelit", "moonlit", "silhouette")
 
 
-def log_debug(stage, message):
-    """Best-effort write of a diagnostic line to Supabase pipeline_debug,
-    so failures are visible without needing GitHub Actions log access.
-    Never raises - a logging failure must not break the pipeline."""
-    print(f"  [debug] {stage}: {message}")
-    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-        return
+def round_to_valid_frames(n):
+    k = max(0, round((n - 1) / 8))
+    return 8 * k + 1
+
+
+def agnes_headers():
+    return {"Authorization": f"Bearer {AGNES_API_KEY}", "Content-Type": "application/json"}
+
+
+def build_prompt(scene_text, use_fallback=False):
+    is_dark = any(k in scene_text.lower() for k in DARK_SCENE_KEYWORDS)
+    lighting = "moody, intentionally low-light scene as part of the story" if is_dark else LIGHTING_CUE_BRIGHT
+    if use_fallback:
+        return f"{lighting}, {QUALITY_GUARD}, cinematic documentary shot"
+    return f"{lighting}, {QUALITY_GUARD}, {scene_text}"
+
+
+def http_post_json(url, payload, headers, timeout=60):
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
-        body = json.dumps({"stage": stage, "message": str(message)[:2000]}).encode()
-        req = urllib.request.Request(
-            f"{SUPABASE_URL}/rest/v1/pipeline_debug",
-            data=body,
-            method="POST",
-            headers={
-                "apikey": SUPABASE_ANON_KEY,
-                "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-                "Content-Type": "application/json",
-                "Prefer": "return=minimal",
-            },
-        )
-        urllib.request.urlopen(req, timeout=15)
-    except Exception:
-        pass
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        try:
+            data = json.loads(e.read() or b"{}")
+        except Exception:
+            data = {}
+        return e.code, data
 
 
-def build_image_prompt(scene):
-    """Prepend a strong, front-loaded style + lighting cue to every scene
-    prompt. Front-loading matters because prompt weighting favors earlier
-    tokens."""
-    is_intentionally_dark = any(word in scene.lower() for word in DARK_SCENE_KEYWORDS)
-    if is_intentionally_dark:
-        lighting_cue = "Moody, intentionally low-light scene as part of the story. "
-    else:
-        lighting_cue = (
-            "Brightly and evenly lit scene, no underexposure, no murky shadows. "
-        )
-    return STYLE_CUE + lighting_cue + scene
+def http_get_json(url, headers, timeout=30):
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        try:
+            data = json.loads(e.read() or b"{}")
+        except Exception:
+            data = {}
+        return e.code, data
 
 
-def fetch_image(prompt, out_path, seed):
-    encoded = urllib.parse.quote(prompt, safe="")
-    url = (
-        f"{IMAGE_BASE_URL}{encoded}"
-        f"?width={IMAGE_WIDTH}&height={IMAGE_HEIGHT}&seed={seed}&nologo=true"
-    )
+def create_video_task(prompt, num_frames, image_url=None):
+    payload = {"model": "agnes-video-v2.0", "prompt": prompt, "height": HEIGHT,
+               "width": WIDTH, "num_frames": num_frames, "frame_rate": FRAME_RATE}
+    if image_url:
+        payload["image"] = image_url
+    last_status = None
+    for attempt in range(4):
+        status, data = http_post_json(f"{AGNES_BASE}/videos", payload, agnes_headers())
+        if status == 400 and "content_policy_violation" in json.dumps(data):
+            raise ValueError("content_policy_violation")
+        if status in AGNES_RETRYABLE:
+            last_status = status
+            time.sleep(RETRY_BACKOFF_BASE * (attempt + 1))
+            continue
+        if status >= 400:
+            raise RuntimeError(f"Agnes video create error {status}: {data}")
+        return data.get("video_id") or data.get("id") or data.get("task_id")
+    raise RuntimeError(f"Agnes overloaded after retries (last status {last_status})")
+
+
+def poll_video_task(video_id, max_wait=280, interval=10):
+    waited = 0
+    while waited < max_wait:
+        status, data = http_get_json(
+            f"{AGNES_POLL_URL}?video_id={video_id}&model_name=agnes-video-v2.0", agnes_headers())
+        if status == 400 and "content_policy_violation" in json.dumps(data):
+            raise ValueError("content_policy_violation")
+        st = data.get("status")
+        if st == "completed":
+            for k in ("video_url", "url"):
+                if isinstance(data.get(k), str):
+                    return data[k]
+            for v in data.values():
+                if isinstance(v, str) and v.startswith("http") and v.endswith(".mp4"):
+                    return v
+            raise RuntimeError(f"Completed but no video URL: {data}")
+        if st == "failed":
+            raise RuntimeError(f"Agnes generation failed: {data}")
+        time.sleep(interval)
+        waited += interval
+    raise RuntimeError("Agnes video generation timed out")
+
+
+def download(url, out_path):
     req = urllib.request.Request(url, headers={"User-Agent": "TechPulse/1.0"})
-    with urllib.request.urlopen(req, timeout=90) as resp:
+    with urllib.request.urlopen(req, timeout=120) as resp:
         data = resp.read()
-    if len(data) < 1000:
-        # Pollinations returns a tiny error/placeholder image on failure
-        # rather than an HTTP error status in some cases.
-        raise RuntimeError(f"Pollinations returned a suspiciously small image ({len(data)} bytes)")
     with open(out_path, "wb") as f:
         f.write(data)
 
 
-def generate_scene_image(scene, title, out_path, seed):
-    prompt = build_image_prompt(scene)
+def generate_character_reference(anchor_text, out_path):
+    prompt = (f"{anchor_text}, character reference portrait, full figure visible, "
+              f"neutral pose, clear face and clothing detail, {LIGHTING_CUE_BRIGHT}, {QUALITY_GUARD}")
+    status, data = http_post_json(AGNES_IMAGE_URL,
+        {"model": "agnes-image-2.1-flash", "prompt": prompt, "size": f"{WIDTH}x{HEIGHT}",
+         "extra_body": {"response_format": "url"}}, agnes_headers())
+    if status >= 400:
+        print(f"  Character reference failed ({status}): {data} - continuing without one.")
+        return None
+    url = None
+    for entry in data.get("data", []):
+        if isinstance(entry, dict) and entry.get("url"):
+            url = entry["url"]
+            break
+    return url or data.get("url")
+
+
+def extract_last_frame(video_path, out_png):
+    subprocess.run(["ffmpeg", "-y", "-sseof", "-1", "-i", video_path, "-update", "1", "-q:v", "2", out_png],
+                   check=True, capture_output=True)
+    return out_png
+
+
+def upload_to_tmpfiles(local_path):
+    """Agnes needs a public image URL for image-to-video anchoring. Uses
+    tmpfiles.org (free, no key, no signup) to host the extracted frame /
+    reference image just long enough for Agnes to fetch it."""
+    boundary = "----tpdboundary"
+    with open(local_path, "rb") as f:
+        file_bytes = f.read()
+    body = (
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"f.png\"\r\n"
+        f"Content-Type: image/png\r\n\r\n"
+    ).encode() + file_bytes + f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request("https://tmpfiles.org/api/v1/upload", data=body,
+                                  headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read())
+        url = result.get("data", {}).get("url", "")
+        return url.replace("tmpfiles.org/", "tmpfiles.org/dl/") if url else None
+    except Exception as e:
+        print(f"  tmpfiles upload failed, continuing without a continuity anchor: {e}")
+        return None
+
+
+def generate_scene_clip(scene_text, out_path, anchor_image_url=None):
+    num_frames = round_to_valid_frames(int(CLIP_SECONDS * FRAME_RATE))
+    num_frames = max(MIN_FRAMES, min(MAX_FRAMES, num_frames))
     for attempt in range(1, MAX_SCENE_RETRIES + 1):
         try:
-            fetch_image(prompt, out_path, seed)
+            prompt = build_prompt(scene_text, use_fallback=False)
+            try:
+                video_id = create_video_task(prompt, num_frames, image_url=anchor_image_url)
+            except ValueError:
+                print("  Content policy rejection - retrying with generic fallback prompt")
+                fallback_prompt = build_prompt(scene_text, use_fallback=True)
+                video_id = create_video_task(fallback_prompt, num_frames, image_url=anchor_image_url)
+            video_url = poll_video_task(video_id)
+            download(video_url, out_path)
             return True
-        except urllib.error.HTTPError as e:
-            wait = RETRY_BACKOFF_BASE_SECONDS * attempt
-            print(f"  Attempt {attempt}/{MAX_SCENE_RETRIES} error on a scene for {title}: HTTP {e.code}")
-            log_debug("video", f"HTTP {e.code} for {title} scene image, attempt {attempt}")
         except Exception as e:
-            wait = RETRY_BACKOFF_BASE_SECONDS * attempt
-            print(f"  Attempt {attempt}/{MAX_SCENE_RETRIES} error on a scene for {title}: {e}")
-            log_debug("video", f"Attempt {attempt} exception for {title}: {e}")
-        if attempt < MAX_SCENE_RETRIES:
-            time.sleep(wait)
+            print(f"  Attempt {attempt}/{MAX_SCENE_RETRIES} failed: {e}")
+            if attempt < MAX_SCENE_RETRIES:
+                time.sleep(RETRY_BACKOFF_BASE * attempt)
     return False
 
 
 def generate_videos(scripts_path="script/latest_scripts.json", out_path="video/latest_videos.json"):
-    """Kept the name generate_videos()/latest_videos.json so pipeline.yml
-    and downstream stages don't need to change - the output now contains
-    image_urls (local file paths) instead of clip_urls."""
     with open(scripts_path) as f:
         scripts = json.load(f)
 
-    os.makedirs("video/images", exist_ok=True)
+    os.makedirs("video/clips", exist_ok=True)
     videos = []
     for s_idx, s in enumerate(scripts):
-        expected = len(s["scenes"])
-        image_paths = []
-        for i, scene in enumerate(s["scenes"]):
-            if i > 0:
-                time.sleep(SCENE_DELAY_SECONDS)
-            image_out_path = f"video/images/scene_{s_idx}_{i}.jpg"
-            seed = abs(hash((s["title"], i))) % 1_000_000
-            ok = generate_scene_image(scene, s["title"], image_out_path, seed)
-            if ok:
-                image_paths.append(image_out_path)
-                print(f"  Generated scene image for: {s['title']}")
-            else:
-                print(f"  Giving up on a scene for: {s['title']} after {MAX_SCENE_RETRIES} retries")
+        scenes = s["scenes"]
+        clip_paths = []
 
-        if len(image_paths) == expected:
-            videos.append({**s, "image_urls": image_paths})
-            print(f"Generated {len(image_paths)}/{expected} images for: {s['title']}")
+        ref_path = f"video/clips/ref_{s_idx}.png"
+        anchor_url = generate_character_reference(scenes[0], ref_path)
+        if anchor_url:
+            print(f"  Character reference ready for: {s['title']}")
         else:
-            print(f"SKIPPING '{s['title']}': only {len(image_paths)}/{expected} scenes succeeded")
-            log_debug("video", f"SKIPPING '{s['title']}': only {len(image_paths)}/{expected} scenes succeeded")
+            print(f"  No character reference for: {s['title']} - first scene will generate blind.")
+
+        for i, scene in enumerate(scenes):
+            clip_path = f"video/clips/clip_{s_idx}_{i}.mp4"
+            ok = generate_scene_clip(scene, clip_path, anchor_image_url=anchor_url)
+            if not ok:
+                print(f"  Giving up on scene {i} for: {s['title']}")
+                break
+            clip_paths.append(clip_path)
+            try:
+                last_frame_png = f"video/clips/lastframe_{s_idx}_{i}.png"
+                extract_last_frame(clip_path, last_frame_png)
+                new_anchor = upload_to_tmpfiles(last_frame_png)
+                if new_anchor:
+                    anchor_url = new_anchor
+                if os.path.exists(last_frame_png):
+                    os.remove(last_frame_png)
+            except Exception as e:
+                print(f"  Could not extract continuity anchor from scene {i}, next scene generates blind: {e}")
+
+        if len(clip_paths) == len(scenes):
+            videos.append({**s, "video_urls": clip_paths})
+            print(f"Generated {len(clip_paths)}/{len(scenes)} clips for: {s['title']}")
+        else:
+            print(f"SKIPPING '{s['title']}': only {len(clip_paths)}/{len(scenes)} scenes succeeded")
 
     with open(out_path, "w") as f:
         json.dump(videos, f, indent=2)
