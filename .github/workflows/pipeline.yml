@@ -13,7 +13,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install dependencies
-        run: pip install feedparser google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2 gTTS
+       run: pip install feedparser google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2 edge-tts
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Research stage
