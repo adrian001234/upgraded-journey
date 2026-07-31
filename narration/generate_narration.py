@@ -1,18 +1,23 @@
 """
 TechPulse - Narration Stage
-Converts each video's narration text into speech via gTTS (Google's free TTS).
+Converts each video's narration text into speech via Edge TTS (Microsoft's free, natural-sounding TTS).
+Voice: en-US-GuyNeural (male, upbeat/confident), sped up slightly for a punchier, more energetic read.
 """
 
+import asyncio
 import json
 import os
-from gtts import gTTS
+import edge_tts
 
 AUDIO_DIR = "narration/audio"
+VOICE = "en-US-GuyNeural"
+RATE = "+8%"
+PITCH = "+0Hz"
 
 
-def generate_narration_audio(text, out_path):
-    tts = gTTS(text=text, lang="en")
-    tts.save(out_path)
+async def generate_narration_audio(text, out_path):
+    communicate = edge_tts.Communicate(text, voice=VOICE, rate=RATE, pitch=PITCH)
+    await communicate.save(out_path)
 
 
 def generate_all_narrations(videos_path="video/latest_videos.json", out_path="narration/latest_narrations.json"):
@@ -24,7 +29,7 @@ def generate_all_narrations(videos_path="video/latest_videos.json", out_path="na
     for i, v in enumerate(videos):
         audio_path = f"{AUDIO_DIR}/narration_{i}.mp3"
         try:
-            generate_narration_audio(v["narration"], audio_path)
+            asyncio.run(generate_narration_audio(v["narration"], audio_path))
             results.append({**v, "audio_path": audio_path})
             print(f"Narrated: {v['title']}")
         except Exception as e:
