@@ -12,11 +12,16 @@ import urllib.error
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key={GEMINI_KEY}"
 
-PROMPT_TEMPLATE = """You are writing a YouTube Short for a tech/AI/science news channel.
+PROMPT_TEMPLATE = """You are writing a YouTube Short for a tech/AI/science news channel. Your ONLY job is to make the viewer physically unable to look away and to make liking/subscribing feel like the obvious next move, not an ask.
 Headline: {title}
 Summary: {summary}
 Write THREE separate things:
-1. NARRATION: A 30-40 second spoken voiceover script (90-120 words). Start with a scroll-stopping hook in the very first sentence (a bold claim, surprising number, or curiosity-gap question) — no slow lead-in. Keep every sentence short and easy to say out loud. No filler, no robotic phrasing, no repeated words. End with a punchy one-line payoff (not a generic "and that's it").
+1. NARRATION: A 30-40 second spoken voiceover script (90-120 words). Structure it like this:
+   - FIRST SENTENCE (0-3 seconds): a pattern-interrupt hook that makes scrolling past feel like a mistake — a shocking number, a claim that sounds impossible, or a question the viewer needs answered ("Why does X always happen right before Y?"). No greeting, no setup, no "did you know."
+   - MIDDLE: build tension in short, punchy sentences — each one should make the next one feel necessary. Use a curiosity gap: reveal part of the picture, withhold the twist. Concrete numbers and specifics beat vague claims every time. No filler, no robotic phrasing, no repeated words, no hedging language ("some experts believe", "it seems").
+   - PAYOFF (final 1-2 sentences): deliver the twist or the stakes in a single punchy line that lands hard and re-contextualizes everything before it — never a flat summary.
+   - FINAL LINE: fold the call-to-action into the payoff's energy, not bolted on after it — e.g. "If that surprised you, you need to see what's next — like this and follow before it disappears" or "Subscribe now, because this is only going to get wilder." It must feel like the natural high emotional peak of the story, not a scripted outro. Never use a generic, low-energy CTA like "don't forget to like and subscribe."
+   Read the whole thing out loud in your head before finalizing — if any sentence would make a real person tap away, rewrite it.
 2. HAS_RECURRING_PERSON: true only if the headline/summary is actually about a specific, named individual whose face or actions are central to the story (a founder, a scientist, a public figure). false for abstract, statistical, institutional, or trend-based stories (research findings, market data, company-wide behavior, policy, industry patterns) — these should be shown through environments, objects, and data, not an invented person.
 3. SCENES: An array of exactly 7 short cinematic scene descriptions for an AI video generator, meant to play in sequence as B-roll matching the story as it unfolds — each describing camera angle, lighting, and setting. Vary the shots (don't repeat the same framing).
 
