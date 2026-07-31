@@ -4,8 +4,9 @@ Takes the real AI video clips from the Video stage (video_urls, one clip
 per scene) and fits each to its share of the narration's total length -
 trimming if the clip runs long, holding its final frame if it runs short -
 then concatenates and muxes with the narration audio plus a low, ducked
-ambient background bed (free royalty-free tracks, looped/trimmed to length)
-so the final video doesn't sit dead silent under the voiceover.
+ambient background bed (free royalty-free tracks, looped/trimmed to length),
+and burns in the SRT captions from the Narration stage - 85% of Shorts are
+watched muted, so captions are treated as required output, not optional.
 """
 import json
 import os
@@ -17,15 +18,18 @@ FINAL_DIR = "assembly/final"
 TMP_DIR = "assembly/tmp"
 FPS = 24
 
-# Free, royalty-free, no-key-required direct download links (Pixabay Music CDN).
-# Kept deliberately neutral/ambient so they sit under any story topic without
-# clashing tonally.
 AMBIENT_TRACKS = [
     "https://cdn.pixabay.com/download/audio/2022/05/27/audio_1808fbf07a.mp3",
     "https://cdn.pixabay.com/download/audio/2021/11/25/audio_00fa5b4a37.mp3",
     "https://cdn.pixabay.com/download/audio/2022/03/10/audio_c8a76c3c5b.mp3",
 ]
-AMBIENT_VOLUME = 0.12  # relative to narration, deliberately low so it reads as atmosphere not competition
+AMBIENT_VOLUME = 0.12
+
+CAPTION_STYLE = (
+    "FontName=Arial Black,FontSize=13,PrimaryColour=&H00FFFFFF,"
+    "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,"
+    "Alignment=2,MarginV=90,Bold=1"
+)
 
 
 def get_duration(path):
@@ -69,9 +73,6 @@ def fit_clip_to_duration(clip_path, target_duration, out_path):
 
 
 def get_ambient_track(target_duration, out_path):
-    """Download a random ambient track and loop/trim it to exactly target_duration.
-    Returns None (caller should proceed narration-only) if the download fails -
-    a missing ambient bed should never break the whole pipeline run."""
     url = random.choice(AMBIENT_TRACKS)
     raw_path = out_path.replace(".mp3", "_raw.mp3")
     try:
@@ -94,8 +95,6 @@ def get_ambient_track(target_duration, out_path):
 
 
 def build_audio_track(narration_path, target_duration, out_path, index):
-    """Mix narration with a low, ducked ambient bed. Falls back to narration
-    alone if the ambient track can't be fetched for any reason."""
     ambient_path = f"{TMP_DIR}/ambient_{index}.mp3"
     ambient = get_ambient_track(target_duration, ambient_path)
 
@@ -114,7 +113,12 @@ def build_audio_track(narration_path, target_duration, out_path, index):
     return out_path
 
 
-def assemble_one(clip_paths, audio_path, out_path, index):
+def escape_for_subtitles_filter(path):
+    abs_path = os.path.abspath(path)
+    return abs_path.replace("\\", "\\\\").replace(":", "\\:")
+
+
+def assemble_one(clip_paths, audio_path, out_path, index, captions_path=None):
     audio_duration = get_duration(audio_path)
     segment_duration = audio_duration / len(clip_paths)
 
@@ -136,11 +140,31 @@ def assemble_one(clip_paths, audio_path, out_path, index):
     mixed_audio_path = f"{TMP_DIR}/mixed_audio_{index}.m4a"
     build_audio_track(audio_path, audio_duration, mixed_audio_path, index)
 
-    subprocess.run([
+    final_cmd = [
         "ffmpeg", "-y", "-i", concat_video_path, "-i", mixed_audio_path,
-        "-c:v", "libx264", "-c:a", "aac", "-map", "0:v:0", "-map", "1:a:0",
-        "-shortest", out_path,
-    ], check=True, capture_output=True)
+        "-c:v", "libx264", "-c:a", "aac", "-map", "0:v:0", "-map", "1:a:0", "-shortest",
+    ]
+    if captions_path and os.path.exists(captions_path):
+        escaped = escape_for_subtitles_filter(captions_path)
+        final_cmd[final_cmd.index("-c:v"):final_cmd.index("-c:v")] = [
+            "-vf", f"subtitles={escaped}:force_style='{CAPTION_STYLE}'"
+        ]
+    final_cmd.append(out_path)
+
+    try:
+        subprocess.run(final_cmd, check=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+        if captions_path:
+            print(f"  Caption burn-in failed ({e.stderr.decode(errors='replace')[:300]}) - "
+                  f"retrying without captions so the run still completes.")
+            fallback_cmd = [
+                "ffmpeg", "-y", "-i", concat_video_path, "-i", mixed_audio_path,
+                "-c:v", "libx264", "-c:a", "aac", "-map", "0:v:0", "-map", "1:a:0",
+                "-shortest", out_path,
+            ]
+            subprocess.run(fallback_cmd, check=True, capture_output=True)
+        else:
+            raise
 
     for p in fitted_paths:
         os.remove(p)
@@ -160,7 +184,8 @@ def assemble_all(narrations_path="narration/latest_narrations.json", out_path="a
     for i, item in enumerate(items):
         final_path = f"{FINAL_DIR}/final_{i}.mp4"
         try:
-            assemble_one(item["video_urls"], item["audio_path"], final_path, i)
+            assemble_one(item["video_urls"], item["audio_path"], final_path, i,
+                         captions_path=item.get("captions_path"))
             results.append({**item, "final_path": final_path})
             print(f"Assembled: {item['title']}")
         except Exception as e:
