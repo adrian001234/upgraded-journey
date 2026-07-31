@@ -1,14 +1,76 @@
 """
 TechPulse - Tracking Stage
 Pushes generated videos into the Supabase video_pipeline table.
+
+FIXED (2026-08-01): this stage used to read video/latest_videos.json (the
+PRE-narration, PRE-assembly per-scene clip list) and insert a row with
+status hardcoded to "video_generated" regardless of whether narration,
+assembly, or upload had actually happened - it never referenced the real
+final video at all. Every run since the gTTS narration fix landed
+(2026-07-30 onward) was writing false-success rows: status="video_generated"
+with video_url left NULL, while zero files ever reached Supabase storage.
+
+Now this stage:
+1. Reads assembly/latest_final.json - the REAL post-assembly output, which
+   has a final_path pointing to an actual muxed video+narration mp4 on disk.
+2. Uploads that file to the "videos" Supabase Storage bucket.
+3. Only inserts status="video_generated" (with a real, working video_url)
+   if the upload actually succeeds. If assembly never produced a file, or
+   the upload fails, the row is inserted as status="failed" with an error
+   note instead - so the database can never again silently claim success
+   for something that didn't happen.
 """
 
 import json
 import os
+import mimetypes
 import urllib.request
+import urllib.error
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_ANON_KEY = os.environ["SUPABASE_ANON_KEY"]
+BUCKET = "videos"
+
+
+def upload_video_file(local_path, dest_name):
+    """Uploads a local video file to the 'videos' storage bucket and
+    returns its public URL, or None if the upload fails for any reason."""
+    if not os.path.exists(local_path):
+        print(f"  Upload skipped - file does not exist on disk: {local_path}")
+        return None
+
+    with open(local_path, "rb") as f:
+        file_bytes = f.read()
+
+    if not file_bytes:
+        print(f"  Upload skipped - file is empty: {local_path}")
+        return None
+
+    content_type = mimetypes.guess_type(local_path)[0] or "video/mp4"
+    url = f"{SUPABASE_URL}/storage/v1/object/{BUCKET}/{dest_name}"
+    req = urllib.request.Request(
+        url,
+        data=file_bytes,
+        method="POST",
+        headers={
+            "apikey": SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+            "Content-Type": content_type,
+            "x-upsert": "true",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            resp.read()
+        print(f"  Uploaded {local_path} -> {dest_name} ({len(file_bytes)} bytes)")
+        return f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET}/{dest_name}"
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        print(f"  Upload FAILED ({e.code}) for {local_path}: {body}")
+        return None
+    except Exception as e:
+        print(f"  Upload FAILED (exception) for {local_path}: {e}")
+        return None
 
 
 def insert_video(record):
@@ -27,30 +89,55 @@ def insert_video(record):
     urllib.request.urlopen(req)
 
 
-def sync_videos(videos_path="video/latest_videos.json"):
-    with open(videos_path) as f:
-        videos = json.load(f)
+def sync_videos(final_path="assembly/latest_final.json"):
+    if not os.path.exists(final_path):
+        print(f"FATAL: {final_path} does not exist - assembly stage produced no output file at all. "
+              f"Nothing to sync this run.")
+        return
 
-    count = 0
-    for v in videos:
+    with open(final_path) as f:
+        items = json.load(f)
+
+    if not items:
+        print("Assembly produced an empty list - no videos to sync this run.")
+        return
+
+    success_count = 0
+    fail_count = 0
+
+    for i, item in enumerate(items):
+        title = item.get("title", f"untitled_{i}")
+        local_final_path = item.get("final_path")
+
+        video_url = None
+        if local_final_path:
+            dest_name = f"{item.get('source', 'techpulse')}_{i}_{os.path.basename(local_final_path)}"
+            video_url = upload_video_file(local_final_path, dest_name)
+
+        record = {
+            "title": title,
+            "source": item.get("source", ""),
+            "link": item.get("link", ""),
+            "script": item.get("narration", item.get("script", "")),
+        }
+
+        if video_url:
+            record["status"] = "video_generated"
+            record["video_url"] = video_url
+            success_count += 1
+        else:
+            record["status"] = "failed"
+            fail_count += 1
+            print(f"  '{title}' marked status=failed - no working video_url (assembly output missing, "
+                  f"empty, or upload failed). This will NOT be counted as a successful video.")
+
         try:
-            # No final assembled video exists yet at this stage - only the
-            # individual scene clip_urls. video_url is nullable, so we
-            # leave it unset here rather than referencing a key that
-            # doesn't exist on this stage's data (was causing every
-            # insert to silently fail with a KeyError).
-            insert_video({
-                "title": v["title"],
-                "source": v["source"],
-                "link": v["link"],
-                "script": v.get("narration", ""),
-                "status": "video_generated",
-            })
-            count += 1
+            insert_video(record)
         except Exception as e:
-            print(f"Failed to sync {v['title']}: {e}")
+            print(f"  Could not even insert the tracking row for '{title}': {e}")
 
-    print(f"Synced {count} videos to Supabase")
+    print(f"Synced {success_count + fail_count} rows to Supabase: "
+          f"{success_count} real videos, {fail_count} marked failed (no false successes).")
 
 
 if __name__ == "__main__":
