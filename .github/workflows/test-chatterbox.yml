@@ -1,0 +1,44 @@
+name: Test Chatterbox TTS
+on:
+  workflow_dispatch:
+
+jobs:
+  test-chatterbox:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Chatterbox
+        run: pip install chatterbox-tts
+
+      - name: Generate test sample
+        run: |
+          python3 - << 'EOF'
+          import time
+          from chatterbox.tts import ChatterboxTTS
+          import torchaudio
+
+          text = "After a shocking quarter, IBM insists that AI isn't killing the mainframe. But three former engineers tell a very different story."
+
+          t0 = time.time()
+          model = ChatterboxTTS.from_pretrained(device="cpu")
+          print(f"Model load time: {time.time()-t0:.1f}s")
+
+          t1 = time.time()
+          wav = model.generate(text)
+          print(f"Generation time: {time.time()-t1:.1f}s")
+
+          torchaudio.save("chatterbox_sample.wav", wav, model.sr)
+          print("Saved.")
+          EOF
+
+      - name: Upload sample
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatterbox-sample
+          path: chatterbox_sample.wav
