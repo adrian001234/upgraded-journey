@@ -156,26 +156,43 @@ def extract_last_frame(video_path, out_png):
     return out_png
 
 
-def upload_to_tmpfiles(local_path):
-    """Agnes needs a public image URL for image-to-video anchoring. Uses
-    tmpfiles.org (free, no key, no signup) to host the extracted frame /
-    reference image just long enough for Agnes to fetch it."""
-    boundary = "----tpdboundary"
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
+ANCHOR_BUCKET = "video_clips"
+
+
+def upload_to_supabase(local_path):
+    """Agnes needs a public image URL for image-to-video anchoring. Uploads
+    the extracted frame / reference image to Supabase Storage (same project
+    already used by tracking/save_to_supabase.py), matching the approach
+    used in the Marius pipeline. Replaces the old tmpfiles.org upload,
+    which started returning 403 Forbidden on every request."""
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+        print("  SUPABASE_URL/SUPABASE_ANON_KEY not set, continuing without a continuity anchor.")
+        return None
     with open(local_path, "rb") as f:
         file_bytes = f.read()
-    body = (
-        f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"f.png\"\r\n"
-        f"Content-Type: image/png\r\n\r\n"
-    ).encode() + file_bytes + f"\r\n--{boundary}--\r\n".encode()
-    req = urllib.request.Request("https://tmpfiles.org/api/v1/upload", data=body,
-                                  headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    dest_name = f"anchors/{os.path.basename(local_path)}"
+    url = f"{SUPABASE_URL}/storage/v1/object/{ANCHOR_BUCKET}/{dest_name}"
+    req = urllib.request.Request(
+        url, data=file_bytes, method="POST",
+        headers={
+            "apikey": SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+            "Content-Type": "image/png",
+            "x-upsert": "true",
+        },
+    )
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
-            result = json.loads(resp.read())
-        url = result.get("data", {}).get("url", "")
-        return url.replace("tmpfiles.org/", "tmpfiles.org/dl/") if url else None
+            resp.read()
+        return f"{SUPABASE_URL}/storage/v1/object/public/{ANCHOR_BUCKET}/{dest_name}"
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        print(f"  Supabase anchor upload failed ({e.code}), continuing without a continuity anchor: {body}")
+        return None
     except Exception as e:
-        print(f"  tmpfiles upload failed, continuing without a continuity anchor: {e}")
+        print(f"  Supabase anchor upload failed, continuing without a continuity anchor: {e}")
         return None
 
 
@@ -235,7 +252,7 @@ def generate_videos(scripts_path="script/latest_scripts.json", out_path="video/l
                 try:
                     last_frame_png = f"video/clips/lastframe_{s_idx}_{i}.png"
                     extract_last_frame(clip_path, last_frame_png)
-                    new_anchor = upload_to_tmpfiles(last_frame_png)
+                    new_anchor = upload_to_supabase(last_frame_png)
                     if new_anchor:
                         anchor_url = new_anchor
                     if os.path.exists(last_frame_png):
