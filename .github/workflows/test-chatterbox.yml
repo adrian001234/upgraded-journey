@@ -13,6 +13,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
       - name: Install Chatterbox
         run: pip install chatterbox-tts
 
@@ -33,9 +36,13 @@ jobs:
           wav = model.generate(text)
           print(f"Generation time: {time.time()-t1:.1f}s")
 
-          torchaudio.save("chatterbox_sample.wav", wav, model.sr)
-          print("Saved.")
+          torchaudio.save("chatterbox_raw.wav", wav, model.sr)
+          print("Saved raw.")
           EOF
+
+      - name: Slow down 8 percent (pitch preserved)
+        run: |
+          ffmpeg -i chatterbox_raw.wav -filter:a "atempo=0.92" chatterbox_sample.wav
 
       - name: Upload sample
         uses: actions/upload-artifact@v4
