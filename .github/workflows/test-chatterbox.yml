@@ -16,10 +16,10 @@ jobs:
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
-      - name: Install Chatterbox
-        run: pip install chatterbox-tts
+      - name: Install Chatterbox and faster-whisper
+        run: pip install chatterbox-tts faster-whisper
 
-      - name: Generate test sample
+      - name: Generate audio
         run: |
           python3 - << 'EOF'
           import time
@@ -44,8 +44,57 @@ jobs:
         run: |
           ffmpeg -i chatterbox_raw.wav -filter:a "atempo=0.92" chatterbox_sample.wav
 
-      - name: Upload sample
+      - name: Generate word-level captions with faster-whisper
+        run: |
+          python3 - << 'EOF'
+          import time
+          from faster_whisper import WhisperModel
+
+          t0 = time.time()
+          model = WhisperModel("base.en", device="cpu", compute_type="int8")
+          print(f"Whisper load time: {time.time()-t0:.1f}s")
+
+          t1 = time.time()
+          segments, info = model.transcribe("chatterbox_sample.wav", word_timestamps=True)
+
+          WORDS_PER_CAPTION_CHUNK = 4
+
+          def fmt(t):
+              h = int(t // 3600)
+              m = int((t % 3600) // 60)
+              s = int(t % 60)
+              ms = int((t - int(t)) * 1000)
+              return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+          words = []
+          for seg in segments:
+              for w in seg.words:
+                  words.append(w)
+
+          print(f"Transcription time: {time.time()-t1:.1f}s, {len(words)} words found")
+
+          srt_lines = []
+          index = 1
+          for i in range(0, len(words), WORDS_PER_CAPTION_CHUNK):
+              group = words[i:i + WORDS_PER_CAPTION_CHUNK]
+              start = group[0].start
+              end = group[-1].end
+              caption_text = " ".join(w.word.strip() for w in group)
+              srt_lines.append(str(index))
+              srt_lines.append(f"{fmt(start)} --> {fmt(end)}")
+              srt_lines.append(caption_text)
+              srt_lines.append("")
+              index += 1
+
+          with open("chatterbox_sample.srt", "w", encoding="utf-8") as f:
+              f.write("\n".join(srt_lines))
+          print("Saved captions.")
+          EOF
+
+      - name: Upload sample and captions
         uses: actions/upload-artifact@v4
         with:
           name: chatterbox-sample
-          path: chatterbox_sample.wav
+          path: |
+            chatterbox_sample.wav
+            chatterbox_sample.srt
