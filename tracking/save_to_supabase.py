@@ -10,10 +10,22 @@ final video at all. Every run since the gTTS narration fix landed
 (2026-07-30 onward) was writing false-success rows: status="video_generated"
 with video_url left NULL, while zero files ever reached Supabase storage.
 
+FIXED (2026-08-03): dest_name used to be built from source + list-index +
+the local file's basename (e.g. "techcrunch_0_final_0.mp4"). Since every
+run's assembly output is always a single-item list, i is always 0, and
+assemble.py always names its output final_0.mp4 - so EVERY run for the
+same source produced the exact same dest_name. Combined with x-upsert:true,
+each new run silently overwrote the previous run's video at that same
+storage path, so a titled row from days ago would end up pointing at
+today's video (or vice versa) instead of its own file. dest_name now
+includes the row's own id (generated here, before insert) so every run
+gets a guaranteed-unique storage path.
+
 Now this stage:
 1. Reads assembly/latest_final.json - the REAL post-assembly output, which
    has a final_path pointing to an actual muxed video+narration mp4 on disk.
-2. Uploads that file to the "videos" Supabase Storage bucket.
+2. Uploads that file to the "videos" Supabase Storage bucket under a
+   unique, per-row path.
 3. Only inserts status="video_generated" (with a real, working video_url)
    if the upload actually succeeds. If assembly never produced a file, or
    the upload fails, the row is inserted as status="failed" with an error
@@ -24,6 +36,7 @@ Now this stage:
 import json
 import os
 import mimetypes
+import uuid
 import urllib.request
 import urllib.error
 
@@ -108,10 +121,12 @@ def sync_videos(final_path="assembly/latest_final.json"):
     for i, item in enumerate(items):
         title = item.get("title", f"untitled_{i}")
         local_final_path = item.get("final_path")
+        row_id = uuid.uuid4().hex
 
         video_url = None
         if local_final_path:
-            dest_name = f"{item.get('source', 'techpulse')}_{i}_{os.path.basename(local_final_path)}"
+            ext = os.path.splitext(local_final_path)[1] or ".mp4"
+            dest_name = f"{item.get('source', 'techpulse')}_{row_id}{ext}"
             video_url = upload_video_file(local_final_path, dest_name)
 
         record = {
