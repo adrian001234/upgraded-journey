@@ -1,7 +1,7 @@
 name: TechPulse Pipeline
 on:
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "0 * * * *"
   workflow_dispatch:
 jobs:
   run-pipeline:
@@ -12,34 +12,93 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Check if a run is actually due
+        id: gate
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          python3 - <<'EOF'
+          import os, json, urllib.request, sys
+          from datetime import datetime, timezone
+
+          url = os.environ.get("SUPABASE_URL", "")
+          key = os.environ.get("SUPABASE_ANON_KEY", "")
+          gh_output = os.environ["GITHUB_OUTPUT"]
+
+          # Fires every hour by cron, but only actually runs the pipeline if the
+          # last successful video was more than ~5.5 hours ago. This exists because
+          # GitHub's own "0 */6 * * *" schedule was confirmed unreliable (silently
+          # skipped runs, no error surfaced) - firing hourly and self-gating here
+          # means a few skipped triggers no longer cause a missed cycle.
+          if not url or not key:
+              print("Supabase creds missing - running to be safe.")
+              with open(gh_output, "a") as f:
+                  f.write("should_run=true\n")
+              sys.exit(0)
+
+          req = urllib.request.Request(
+              f"{url}/rest/v1/video_pipeline?select=created_at&order=created_at.desc&limit=1",
+              headers={"apikey": key, "Authorization": f"Bearer {key}"},
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  rows = json.loads(resp.read())
+          except Exception as e:
+              print(f"Could not reach Supabase ({e}) - running to be safe.")
+              with open(gh_output, "a") as f:
+                  f.write("should_run=true\n")
+              sys.exit(0)
+
+          if not rows:
+              print("No prior rows - running.")
+              with open(gh_output, "a") as f:
+                  f.write("should_run=true\n")
+              sys.exit(0)
+
+          last = datetime.fromisoformat(rows[0]["created_at"].replace("Z", "+00:00"))
+          hours_since = (datetime.now(timezone.utc) - last).total_seconds() / 3600
+          should_run = hours_since >= 5.5
+          print(f"Last video: {hours_since:.2f}h ago -> should_run={should_run}")
+          with open(gh_output, "a") as f:
+              f.write(f"should_run={'true' if should_run else 'false'}\n")
+          EOF
       - name: Install dependencies
+        if: steps.gate.outputs.should_run == 'true'
         run: pip install feedparser google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2 chatterbox-tts faster-whisper
       - name: Install ffmpeg
+        if: steps.gate.outputs.should_run == 'true'
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Research stage
+        if: steps.gate.outputs.should_run == 'true'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
         run: python research/sources.py
       - name: Script stage
+        if: steps.gate.outputs.should_run == 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python script/generate_script.py
       - name: Video stage
+        if: steps.gate.outputs.should_run == 'true'
         env:
           AGNES_API_KEY: ${{ secrets.AGNES_API_KEY }}
         run: python video/generate_video.py
       - name: Narration stage
+        if: steps.gate.outputs.should_run == 'true'
         run: python narration/generate_narration.py
       - name: Assembly stage
+        if: steps.gate.outputs.should_run == 'true'
         run: python assembly/assemble.py
       - name: Tracking stage
+        if: steps.gate.outputs.should_run == 'true'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
         run: python tracking/save_to_supabase.py
       - name: Publish stage
-        if: ${{ vars.YOUTUBE_READY == 'true' }}
+        if: steps.gate.outputs.should_run == 'true' && vars.YOUTUBE_READY == 'true'
         env:
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
