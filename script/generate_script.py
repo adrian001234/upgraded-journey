@@ -3,24 +3,23 @@ TechPulse - Script Stage (LONG-FORM)
 Rewritten 2026-08-04 for the move away from 30-40s Shorts toward long-form
 videos matching Erased/Alternate Earth's format.
 
-Old design: exactly 7 scenes + a single 90-120 word narration block,
-everything generated in one pass. That doesn't scale to long-form because
-Agnes AI is rate-limited per-minute (same wall Marius hit) - a 6-8 minute
-video needs 40-50+ shots, which cannot all render in a single Actions run.
+SCHEMA FIX (2026-08-05): the 2026-08-04 version of this file wrote
+status='shots_pending', narration_full, and a separate video_shots table
+with scene_description rows - but narration/generate_narration.py (also
+rewritten 2026-08-04, ported directly from Marius) actually expects
+status='scripted', row["script"], and a single shot_list JSON array
+living directly on the video_pipeline row, each entry carrying its own
+narration_excerpt. pipeline.yml's gate query already checks for
+status in ('scripted','narrated','video_complete') - that was the real
+intended design all along. This version conforms to it instead of
+building a second, incompatible schema alongside it.
 
-New design: this stage now does ONLY the writing (Gemini call), producing
-a full long-form narration + a full shot list. It writes the narration to
-video_pipeline.narration_full and inserts every shot as its own row in
-video_shots with status='pending'. The video-generation stage pulls ONE
-pending shot per run, renders it via Agnes, and exits - so a rate-limit
-hit just pauses progress on that video instead of failing the whole thing.
-Once video-generation finishes the last shot, it aggregates all shot URLs
-onto this pipeline row and flips status to 'video_complete' - the exact
-trigger the existing, unchanged assemble.py already polls for.
-
-FIXED (2026-08-04): this row must start at a status assemble.py will never
-mistake for its own output - originally mistakenly set to "video_generated"
-(assemble.py's OUTPUT status), corrected to "shots_pending" here.
+Each shot now carries BOTH a narration_excerpt (the exact slice of the
+narration it covers, used by generate_narration.py to compute accurate
+per-shot audio timing) and a visual_description (the actual Agnes video
+prompt). The two are asked for together so the excerpts, concatenated in
+order, reconstruct the full narration - required for narration.py's
+sentence/word-overlap timing algorithm to line up correctly.
 """
 import json
 import os
@@ -31,6 +30,12 @@ GEMINI_KEY = os.environ["GEMINI_API_KEY"]
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key={GEMINI_KEY}"
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_ANON_KEY = os.environ["SUPABASE_ANON_KEY"]
+
+HEADERS = {
+    "apikey": SUPABASE_ANON_KEY,
+    "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+    "Content-Type": "application/json",
+}
 
 TARGET_WORD_COUNT = "900-1100"   # ~6-7 minutes spoken
 TARGET_SHOT_COUNT = 45           # roughly one shot per 8-9 seconds of narration
@@ -43,14 +48,14 @@ Write THREE separate things:
 
 1. NARRATION: A full {word_count} word documentary-style spoken script covering this story in depth - background/context, what happened, why it matters, and implications/what's next. Structure it in clear sections (open with a strong hook, build through the story's key developments, close with a considered takeaway) but write it as continuous flowing narration, not headers or bullet points.
    NEVER OUTPUT CODE: even if the story is about programming, software, or a technical tool, the narration must ONLY ever be plain spoken English describing what happened and why it matters - never literal code, syntax, command-line text, file paths, variable names, or function calls read as if spoken aloud. Describe technical concepts in plain language a general audience would understand, never quote source material verbatim if it contains code or markup.
-   SOUND TAGGING: Wherever the narration describes a concrete, audible event, insert an inline tag: [SFX: short sound description]. Only tag real diegetic sounds implied by the story content.
-   QUOTE TAGGING: If the narration includes a direct quote from a named person actually attributed in the source material, wrap ONLY that quoted portion in [VOICE:quote]...[/VOICE] tags. Never invent a quote.
 
 2. HAS_RECURRING_PERSON: true only if the headline/summary is actually about a specific, named individual whose face or actions are central to the story. false for abstract, statistical, institutional, or trend-based stories.
 
-3. SHOTS: An array of exactly {shot_count} short cinematic scene descriptions for an AI video generator, meant to play in sequence as B-roll matching the story as it unfolds across the full narration - each describing camera angle, lighting, and setting. Vary the shots (don't repeat the same framing).
+3. SHOTS: An array of exactly {shot_count} shot objects, in order, that TOGETHER cover the entire narration from start to finish with no gaps and no overlaps. Each shot object has exactly two fields:
+   - "narration_excerpt": the exact, word-for-word slice of the NARRATION text (from field 1) that plays during this shot. Copy this text verbatim from the narration you wrote - do not paraphrase it. Concatenating every shot's narration_excerpt in order must reconstruct the full narration exactly.
+   - "visual_description": a short cinematic scene description for an AI video generator covering camera angle, lighting, and setting for this moment. Vary the shots (don't repeat the same framing back to back).
 
-CRITICAL consistency rules - the video generator has NO memory between shots, so every shot description must be fully self-contained:
+CRITICAL consistency rules for visual_description - the video generator has NO memory between shots, so every visual_description must be fully self-contained:
 - Pick ONE real-world setting (country/city/company/location) strictly from what the headline and summary actually describe. Do not invent or drift to an unrelated location, and do not add institutions, uniforms, flags, or military/national symbols that are not actually part of the story.
 - If HAS_RECURRING_PERSON is true: invent ONE fixed physical description the first time (approximate age, gender, one or two distinguishing features) and repeat that EXACT description word-for-word in every shot they appear in. Never let age, gender, or appearance drift between shots.
 - If HAS_RECURRING_PERSON is false: do NOT invent any person at all. Build every shot from setting, objects, data visualizations, cityscapes, office/lab/exterior shots, screens, documents, charts - whatever fits the story. A generic unnamed person may appear at most incidentally, never as a repeating anchor.
@@ -60,7 +65,7 @@ CRITICAL consistency rules - the video generator has NO memory between shots, so
 - No anachronisms: only include objects/technology that plausibly belong to the actual time period and setting of the story.
 
 Output strict JSON only, no other text:
-{{"narration": "...", "has_recurring_person": true, "shots": ["...", "..."]}}"""
+{{"narration": "...", "has_recurring_person": true, "shots": [{{"narration_excerpt": "...", "visual_description": "..."}}]}}"""
 
 
 def call_gemini(prompt):
@@ -113,27 +118,17 @@ def _supabase_request(method, path, body=None):
         return json.loads(raw) if raw.strip() else None
 
 
-def insert_pipeline_row(headline, narration, has_recurring_person, total_shots):
+def insert_pipeline_row(headline, narration, has_recurring_person, shot_list):
     row = {
         "title": headline["title"],
         "link": headline.get("link", ""),
         "source": headline.get("source", ""),
-        "narration_full": narration,
-        "total_shots": total_shots,
-        "shots_completed": 0,
-        "generation_status": "shots_generating",
-        "status": "shots_pending",
+        "script": narration,
+        "shot_list": shot_list,
+        "status": "scripted",
     }
     result = _supabase_request("POST", "video_pipeline", row)
     return result[0]["id"]
-
-
-def insert_shots(pipeline_id, shots):
-    rows = [
-        {"pipeline_id": pipeline_id, "shot_number": i + 1, "scene_description": s, "status": "pending"}
-        for i, s in enumerate(shots)
-    ]
-    _supabase_request("POST", "video_shots", rows)
 
 
 def generate_scripts(headlines_path="research/latest_headlines.json"):
@@ -148,12 +143,11 @@ def generate_scripts(headlines_path="research/latest_headlines.json"):
             raw = call_gemini(prompt)
             raw = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
             parsed = json.loads(raw)
-            shots = parsed["shots"]
+            shot_list = parsed["shots"]
             pipeline_id = insert_pipeline_row(
-                h, parsed["narration"], bool(parsed.get("has_recurring_person", False)), len(shots)
+                h, parsed["narration"], bool(parsed.get("has_recurring_person", False)), shot_list
             )
-            insert_shots(pipeline_id, shots)
-            print(f"Created pipeline row {pipeline_id} for '{h['title']}' with {len(shots)} shots.")
+            print(f"Created pipeline row {pipeline_id} for '{h['title']}' with {len(shot_list)} shots, status=scripted.")
         except Exception as e:
             print(f"Failed on {h['title']}: {e}")
 
