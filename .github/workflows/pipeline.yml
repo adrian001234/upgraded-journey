@@ -26,14 +26,6 @@ jobs:
           key = os.environ.get("SUPABASE_ANON_KEY", "")
           gh_output = os.environ["GITHUB_OUTPUT"]
 
-          # Long-form videos take many runs to finish (60-90 shots, Agnes is
-          # rate-limited per-minute), so this pipeline now runs every 15 min
-          # and every stage below is safe to call every time - each one just
-          # picks up whatever row is furthest along and no-ops if there's
-          # nothing at its stage yet. The ONLY thing gated here is starting a
-          # brand NEW story: research+script only fire if nothing is currently
-          # in progress (scripted/narrated/video_complete), so we never queue
-          # up a second story while the first is still being produced.
           if not url or not key:
               print("Supabase creds missing - allowing a new story to start to be safe.")
               with open(gh_output, "a") as f:
@@ -67,3 +59,36 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: python research/sources.py
+      - name: Script stage
+        if: steps.gate.outputs.start_new_story == 'true'
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python script/generate_script.py
+      - name: Narration stage
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: python narration/generate_narration.py
+      - name: Video stage
+        env:
+          AGNES_API_KEY: ${{ secrets.AGNES_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: python video/generate_video.py
+      - name: Assembly stage
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: python assembly/assemble.py
+      - name: Publish stage
+        if: vars.YOUTUBE_READY == 'true'
+        env:
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: python publish/youtube_upload.py
