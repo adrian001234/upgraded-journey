@@ -13,6 +13,14 @@ for weeks with zero published rows despite at least one real upload).
 Now that every row has had a single stable id since the script stage
 created it, there is no text matching involved at all - this stage reads
 the row's own id and writes back to that exact id, full stop.
+
+RETRY LOGIC (2026-08-05): previously any failure (download error, YouTube
+API error) permanently marked the row status='failed' with no automatic
+retry. Now failures leave the row's status untouched (it's already
+'video_generated' with youtube_video_id still null, so the next run's
+query naturally picks it up again) and just increment retry_count, up
+to RETRY_LIMIT times, before finally marking it permanently failed so a
+human notices.
 """
 import os
 from datetime import datetime, timezone
@@ -37,6 +45,8 @@ HEADERS = {
 
 TMP_DIR = "publish/tmp"
 
+RETRY_LIMIT = 3
+
 
 def get_next_video_generated_row():
     resp = requests.get(
@@ -50,12 +60,20 @@ def get_next_video_generated_row():
     return rows[0] if rows else None
 
 
-def mark_failed(row_id, reason):
-    print(f"  Marking row {row_id} failed: {reason}")
-    requests.patch(
-        f"{SUPABASE_URL}/rest/v1/video_pipeline?id=eq.{row_id}",
-        headers=HEADERS, json={"status": "failed"}, timeout=30,
-    )
+def mark_failed(row_id, reason, retry_count):
+    if retry_count < RETRY_LIMIT:
+        next_count = retry_count + 1
+        print(f"  Row {row_id} failed (attempt {next_count}/{RETRY_LIMIT}): {reason}. Will retry next run.")
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/video_pipeline?id=eq.{row_id}",
+            headers=HEADERS, json={"retry_count": next_count}, timeout=30,
+        )
+    else:
+        print(f"  Row {row_id} failed permanently after {RETRY_LIMIT} attempts: {reason}")
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/video_pipeline?id=eq.{row_id}",
+            headers=HEADERS, json={"status": "failed"}, timeout=30,
+        )
 
 
 def download(url, out_path):
@@ -120,12 +138,13 @@ def main():
         return
 
     row_id = row["id"]
+    retry_count = row.get("retry_count") or 0
     title = row.get("title", "untitled")
     narration_text = row.get("script", "")
     video_url = row.get("video_url")
 
     if not video_url:
-        mark_failed(row_id, "video_generated row has no video_url")
+        mark_failed(row_id, "video_generated row has no video_url", retry_count)
         return
 
     os.makedirs(TMP_DIR, exist_ok=True)
@@ -144,7 +163,7 @@ def main():
 
     except Exception as e:
         print(f"ERROR publishing '{title}' (row {row_id}): {e}")
-        raise
+        mark_failed(row_id, str(e), retry_count)
     finally:
         if os.path.exists(local_path):
             os.remove(local_path)
