@@ -1,79 +1,62 @@
 """
-TechPulse - Script Stage
-Turns the latest researched headline into a full long-form narration script
-plus a shot-by-shot production plan, then inserts it directly into the
-Supabase video_pipeline table with status='scripted' - ready for the
-(resumable, checkpointed) video stage to pick up.
+TechPulse - Script Stage (LONG-FORM)
+Rewritten 2026-08-04 for the move away from 30-40s Shorts toward long-form
+videos matching Erased/Alternate Earth's format.
 
-ARCHITECTURE CHANGE (2026-08-04): TDP moved from 30-40s Shorts to 6-8 minute
-long-form videos, matching the format/quality bar of the Erased and
-Alternate Earth channels. A single CI run can no longer generate a whole
-episode's shots in one pass (Agnes AI is rate-limited per-minute; a 6-8 min
-episode needs 60-90 shots). This stage no longer hands off via a JSON file
-to a single-run video stage - it writes a full row (including the entire
-shot_list) straight into video_pipeline, and video/generate_video.py now
-resumes across multiple scheduled runs, checkpointing progress after every
-shot (ported from the proven pattern in marius-command-center/scripts/video_generation.py).
+Old design: exactly 7 scenes + a single 90-120 word narration block,
+everything generated in one pass. That doesn't scale to long-form because
+Agnes AI is rate-limited per-minute (same wall Marius hit) - a 6-8 minute
+video needs 40-50+ shots, which cannot all render in a single Actions run.
 
-RETENTION ENGINEERING: the prompt below is built around what actually
-proven high-retention channels do - a hard stake-first hook in the first
-8 seconds (no channel intro, no throat-clearing), a curiosity gap the
-episode is structured to resolve, escalating tension through the middle,
-a payoff that reuses the single most specific/surprising detail from the
-story, and an in-voice CTA folded into the payoff's energy rather than a
-generic "smash that like button" tacked on the end.
+New design: this stage now does ONLY the writing (Gemini call), producing
+a full long-form narration + a full shot list. It writes the narration to
+video_pipeline.narration_full and inserts every shot as its own row in
+video_shots with status='pending'. The separate video-generation stage
+(next to be rewritten) pulls ONE pending shot per run, renders it via
+Agnes, and exits - so a rate-limit hit just pauses progress on that video
+instead of failing the whole thing. generation_status moves
+scripting -> shots_generating as soon as this stage completes.
 """
 import json
 import os
-import time
-import requests
+import re
+import urllib.request
+import urllib.error
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_ANON_KEY = os.environ["SUPABASE_ANON_KEY"]
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key={GEMINI_KEY}"
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_ANON_KEY = os.environ["SUPABASE_ANON_KEY"]
 
-HEADERS = {
-    "apikey": SUPABASE_ANON_KEY,
-    "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-    "Content-Type": "application/json",
-}
+TARGET_WORD_COUNT = "900-1100"   # ~6-7 minutes spoken
+TARGET_SHOT_COUNT = 45           # roughly one shot per 8-9 seconds of narration
 
-MIN_SHOTS = 60
-MAX_SHOTS = 90
-MAX_GENERATION_ATTEMPTS = 5
-MIN_SETTING_CHARS = 40
-MAX_SETTING_CHARS = 900
-MIN_WORDS = 600
-MAX_WORDS = 1400
+PROMPT_TEMPLATE = """You are writing a long-form YouTube video (6-7 minutes) for a tech/AI/science news channel. Your job is to hold attention for the full length with a documentary-style narrative, not a quick hook-and-CTA format.
+Headline: {title}
+Summary: {summary}
 
-CTA_KEYWORDS = (
-    "comment", "comments", "subscribe", "share this", "share it",
-    "like this", "like and", "tell us", "let us know", "hit follow",
-    "hit that", "follow along", "leave a", "drop a",
-)
-CTA_SEARCH_WINDOW_CHARS = 700
+Write THREE separate things:
 
-VALID_SHOT_TYPES = {
-    "wide", "medium", "close_up", "extreme_close_up", "establishing", "detail_insert"
-}
-VALID_CAMERA_MOVEMENTS = {
-    "static", "pan_left", "pan_right", "tilt_up", "tilt_down", "zoom_in", "zoom_out",
-    "push_in", "pull_out", "dolly_in", "dolly_out", "tracking", "crash_zoom",
-    "whip_pan", "handheld_shake", "orbit", "drone_rise", "drone_descend",
-    "parallax", "focus_pull", "dutch_angle", "snap_zoom", "speed_ramp",
-}
-VALID_LENS_EFFECTS = {"shallow_depth_of_field", "lens_flare", "film_grain", "none"}
+1. NARRATION: A full {word_count} word documentary-style spoken script covering this story in depth - background/context, what happened, why it matters, and implications/what's next. Structure it in clear sections (open with a strong hook, build through the story's key developments, close with a considered takeaway) but write it as continuous flowing narration, not headers or bullet points.
+   NEVER OUTPUT CODE: even if the story is about programming, software, or a technical tool, the narration must ONLY ever be plain spoken English describing what happened and why it matters - never literal code, syntax, command-line text, file paths, variable names, or function calls read as if spoken aloud. Describe technical concepts in plain language a general audience would understand, never quote source material verbatim if it contains code or markup.
+   SOUND TAGGING: Wherever the narration describes a concrete, audible event, insert an inline tag: [SFX: short sound description]. Only tag real diegetic sounds implied by the story content.
+   QUOTE TAGGING: If the narration includes a direct quote from a named person actually attributed in the source material, wrap ONLY that quoted portion in [VOICE:quote]...[/VOICE] tags. Never invent a quote.
 
-ZOOM_FAMILY_MOVEMENTS = {"push_in", "crash_zoom", "zoom_in", "snap_zoom", "dolly_in"}
-MAX_ZOOM_SHOT_RATIO = 0.32
-MAX_CONSECUTIVE_ZOOM_SHOTS = 2
+2. HAS_RECURRING_PERSON: true only if the headline/summary is actually about a specific, named individual whose face or actions are central to the story. false for abstract, statistical, institutional, or trend-based stories.
 
+3. SHOTS: An array of exactly {shot_count} short cinematic scene descriptions for an AI video generator, meant to play in sequence as B-roll matching the story as it unfolds across the full narration - each describing camera angle, lighting, and setting. Vary the shots (don't repeat the same framing).
 
-def load_headline(path="research/latest_headlines.json"):
-    with open(path) as f:
-        headlines = json.load(f)
-    return headlines[0] if headlines else None
+CRITICAL consistency rules - the video generator has NO memory between shots, so every shot description must be fully self-contained:
+- Pick ONE real-world setting (country/city/company/location) strictly from what the headline and summary actually describe. Do not invent or drift to an unrelated location, and do not add institutions, uniforms, flags, or military/national symbols that are not actually part of the story.
+- If HAS_RECURRING_PERSON is true: invent ONE fixed physical description the first time (approximate age, gender, one or two distinguishing features) and repeat that EXACT description word-for-word in every shot they appear in. Never let age, gender, or appearance drift between shots.
+- If HAS_RECURRING_PERSON is false: do NOT invent any person at all. Build every shot from setting, objects, data visualizations, cityscapes, office/lab/exterior shots, screens, documents, charts - whatever fits the story. A generic unnamed person may appear at most incidentally, never as a repeating anchor.
+- ZOOM DISCIPLINE: at most 1-in-4 shots may be push_in/crash_zoom/extreme_close_up. At least 1-in-4 shots must be wide/establishing. Never place two zoom-in-family shots back to back.
+- Avoid close-up shots of hands operating small precise objects (dials, switches, buttons, keyboards) - AI video generators render fine hand-object interaction unreliably. Favor wider shots instead.
+- Every shot must be clearly, brightly lit (natural daylight or bright interior lighting) and state this explicitly, UNLESS the story specifically requires darkness or nighttime - in which case say so explicitly instead.
+- No anachronisms: only include objects/technology that plausibly belong to the actual time period and setting of the story.
+
+Output strict JSON only, no other text:
+{{"narration": "...", "has_recurring_person": true, "shots": ["...", "..."]}}"""
 
 
 def call_gemini(prompt):
@@ -81,295 +64,95 @@ def call_gemini(prompt):
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"response_mime_type": "application/json"}
     }).encode()
-    req_headers = {"Content-Type": "application/json"}
-    last_error = None
-    for attempt in range(4):
-        try:
-            resp = requests.post(GEMINI_URL, data=body, headers=req_headers, timeout=120)
-        except requests.exceptions.RequestException as e:
-            last_error = e
-            wait = (attempt + 1) * 15
-            print(f"Network error calling Gemini ({e}), waiting {wait}s before retry...")
-            time.sleep(wait)
-            continue
-        if resp.status_code == 429:
-            wait = (attempt + 1) * 15
-            print(f"Gemini rate limited, waiting {wait}s before retry...")
-            time.sleep(wait)
-            last_error = resp.text
-            continue
-        if resp.status_code >= 400:
-            raise RuntimeError(f"HTTP {resp.status_code} from Gemini. Body: {resp.text[:500]}")
-        data = resp.json()
-        try:
-            content = data["candidates"][0]["content"]["parts"][0]["text"]
-        except (KeyError, IndexError, TypeError) as e:
-            raise RuntimeError(f"Unexpected response shape from Gemini: {json.dumps(data)[:500]}") from e
-        if not content or not content.strip():
-            raise RuntimeError("Gemini returned an empty completion.")
-        return content.strip()
-    raise RuntimeError(f"Gemini still failing after retries: {last_error}")
-
-
-def extract_json(raw_text):
-    if not raw_text:
-        raise ValueError("Model returned empty/None content.")
-    text = raw_text.strip()
-    if "```" in text:
-        parts = text.split("```")
-        for part in parts:
-            candidate = part.strip()
-            if candidate.startswith("json"):
-                candidate = candidate[4:].strip()
-            if candidate.startswith("{"):
-                text = candidate
-                break
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end < start:
-        raise ValueError("No JSON object found in model output.")
-    return json.loads(text[start:end + 1])
-
-
-def normalize_shot(shot, index):
-    shot_type = shot.get("shot_type")
-    if shot_type not in VALID_SHOT_TYPES:
-        shot_type = "medium"
-    camera_movement = shot.get("camera_movement")
-    if camera_movement not in VALID_CAMERA_MOVEMENTS:
-        camera_movement = "static"
-    lens_effect = shot.get("lens_effect")
-    if lens_effect not in VALID_LENS_EFFECTS:
-        lens_effect = "none"
-    return {
-        "shot_number": shot.get("shot_number", index + 1),
-        "visual_description": shot.get("visual_description", ""),
-        "narration_excerpt": shot.get("narration_excerpt", ""),
-        "shot_type": shot_type,
-        "camera_movement": camera_movement,
-        "camera_reason": shot.get("camera_reason", ""),
-        "lens_effect": lens_effect,
-        "sfx_cue": shot.get("sfx_cue", ""),
-    }
-
-
-def narration_has_engagement_cta(narration_text):
-    if not narration_text:
-        return False
-    window = narration_text[-CTA_SEARCH_WINDOW_CHARS:].lower()
-    return any(keyword in window for keyword in CTA_KEYWORDS)
-
-
-def validate_and_normalize(result):
-    narration_text = (result.get("narration_text") or "").strip()
-    if not narration_text:
-        return False, "missing narration_text"
-
-    word_count = len(narration_text.split())
-    if word_count < MIN_WORDS or word_count > MAX_WORDS:
-        return False, f"narration_text word count {word_count} outside {MIN_WORDS}-{MAX_WORDS} range"
-
-    setting_and_characters = (result.get("setting_and_characters") or "").strip()
-    if len(setting_and_characters) < MIN_SETTING_CHARS:
-        return False, (
-            f"setting_and_characters missing or too short ({len(setting_and_characters)} chars, "
-            f"need at least {MIN_SETTING_CHARS}) - must fix the real-world setting and describe any "
-            f"recurring figure's appearance"
-        )
-    result["setting_and_characters"] = setting_and_characters[:MAX_SETTING_CHARS]
-
-    if not narration_has_engagement_cta(narration_text):
-        return False, (
-            "narration_text is missing an in-voice engagement call-to-action "
-            "(like/subscribe/comment) near the end"
-        )
-
-    shot_list = result.get("shot_list")
-    if not isinstance(shot_list, list) or len(shot_list) == 0:
-        return False, "missing or empty shot_list"
-    if len(shot_list) < MIN_SHOTS or len(shot_list) > MAX_SHOTS:
-        return False, f"shot count {len(shot_list)} outside {MIN_SHOTS}-{MAX_SHOTS} range"
-
-    normalized_shots = [normalize_shot(s, i) for i, s in enumerate(shot_list)]
-
-    zoom_count = sum(
-        1 for s in normalized_shots
-        if s["camera_movement"] in ZOOM_FAMILY_MOVEMENTS or s["shot_type"] == "extreme_close_up"
+    req = urllib.request.Request(
+        GEMINI_URL,
+        data=body,
+        headers={"Content-Type": "application/json"},
     )
-    zoom_ratio = zoom_count / len(normalized_shots)
-    if zoom_ratio > MAX_ZOOM_SHOT_RATIO:
-        return False, (
-            f"too many zoomed-in shots: {zoom_count}/{len(normalized_shots)} ({zoom_ratio:.0%}) "
-            f"over the {MAX_ZOOM_SHOT_RATIO:.0%} ceiling"
-        )
-
-    consecutive_zoom = 0
-    max_consecutive_zoom = 0
-    for s in normalized_shots:
-        if s["camera_movement"] in ZOOM_FAMILY_MOVEMENTS:
-            consecutive_zoom += 1
-            max_consecutive_zoom = max(max_consecutive_zoom, consecutive_zoom)
-        else:
-            consecutive_zoom = 0
-    if max_consecutive_zoom > MAX_CONSECUTIVE_ZOOM_SHOTS:
-        return False, f"{max_consecutive_zoom} zoom-in-family shots in a row (max {MAX_CONSECUTIVE_ZOOM_SHOTS})"
-
-    result["narration_text"] = narration_text
-    result["shot_list"] = normalized_shots
-    result["music_mood"] = (result.get("music_mood") or "").strip() or (
-        "Tense cinematic thriller score, sparse low synth and rising strings at the start, "
-        "driving percussion building through the middle, punchy climax at the biggest reveal, "
-        "tapering to a quiet resolution."
-    )
-    result["has_recurring_person"] = bool(result.get("has_recurring_person", False))
-    return True, result
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            status = resp.status
+            raw_bytes = resp.read()
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode(errors="replace")[:500]
+        raise RuntimeError(f"HTTP {e.code} from Gemini. Body: {error_body}") from e
+    if not raw_bytes.strip():
+        raise RuntimeError(f"Gemini returned an EMPTY body. Status={status}")
+    try:
+        result = json.loads(raw_bytes)
+    except json.JSONDecodeError as e:
+        preview = raw_bytes[:500].decode(errors="replace")
+        raise RuntimeError(f"Gemini response wasn't valid JSON. Status={status}. Body preview: {preview}") from e
+    try:
+        content = result["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError, TypeError) as e:
+        raise RuntimeError(f"Unexpected response shape from Gemini: {json.dumps(result)[:500]}") from e
+    if not content or not content.strip():
+        raise RuntimeError("Gemini returned an empty completion.")
+    print("=== RAW GEMINI OUTPUT (truncated to 1000 chars) ===")
+    print(content.strip()[:1000])
+    print("=== END ===")
+    return content.strip()
 
 
-def generate_script(headline):
-    title = headline["title"]
-    summary = headline.get("summary", "")
-
-    prompt = f"""You are the head writer for a tech/AI/science YouTube channel built for
-maximum retention and subscriber growth - the goal is a video that plays like a thriller,
-not a news recap.
-
-Headline: {title}
-Summary: {summary}
-
-SETTING AND CHARACTERS - write this FIRST, as a fixed visual anchor for the whole video:
-- Ground the story in a concrete real-world setting (company, lab, city, product, event)
-  strictly from what the headline/summary actually describe. Do not invent an unrelated
-  location or institution.
-- "has_recurring_person": true only if the story is genuinely about a specific named
-  individual whose face/actions are central (a founder, scientist, public figure). If true,
-  give ONE fixed physical description (age, build, distinguishing features) that must repeat
-  identically in every shot they appear in. If false, do not invent a person at all - build
-  shots from environments, devices, screens, data visualizations, and objects instead.
-This anchor gets attached to every shot's video-generation prompt later, so write it as a
-standalone paragraph, 2-5 sentences.
-
-OPENING HOOK (first 8 seconds are everything):
-1. STAKE (1-2 sentences): the single most dramatic, concrete fact - a real number, name, or
-   consequence. No "today we're looking at," no channel intro, no setup. Lead with the fact.
-2. VISUAL LOCK (1 sentence): one concrete, specific image/moment that proves the stake is real.
-3. CURIOSITY GAP (1-2 sentences): the specific question the rest of the video answers.
-
-Write a complete 6-8 minute narration script ({MIN_WORDS}-{MAX_WORDS} words) with this
-opening, an escalating middle that keeps raising the stakes and withholding the full picture,
-and a payoff that reuses the single most specific/surprising detail from the headline/summary
-(a number, a name, a timeframe) - never a generic "this changes everything."
-
-CALL TO ACTION - REQUIRED: immediately after the payoff and before any closing line, write
-one natural in-voice sentence that folds the CTA into the payoff's specific energy - it must
-reference the actual detail just delivered (a number, an outcome), not a generic urgency line
-that could paste onto any other story. Use natural phrasing that clearly asks the viewer to
-like, subscribe, and comment (weave in words like "comment," "share," or "subscribe").
-
-NEVER OUTPUT CODE: even if the story is about programming or software, narration must ONLY be
-plain spoken English - never literal code, syntax, file paths, or function calls read aloud.
-
-CINEMATIC DIRECTOR - shot list:
-Break the video into EXACTLY between {MIN_SHOTS} and {MAX_SHOTS} shots, dense sub-sentence
-level breakdown (a narration sentence often spans 2-3 shots). Every shot's visual_description
-must stay consistent with setting_and_characters.
-
-For each shot, provide "shot_type" (wide/medium/close_up/extreme_close_up/establishing/
-detail_insert), "camera_movement" (static/pan_left/pan_right/tilt_up/tilt_down/zoom_in/
-zoom_out/push_in/pull_out/dolly_in/dolly_out/tracking/crash_zoom/whip_pan/handheld_shake/
-orbit/drone_rise/drone_descend/parallax/focus_pull/dutch_angle/snap_zoom/speed_ramp),
-"camera_reason" (one sentence), "lens_effect" (shallow_depth_of_field/lens_flare/film_grain/
-none - use sparingly).
-
-PACING: default to quick shots (2-4s of narration each), fast-cut feel. Only hold a static
-shot deliberately right before a reveal. Never repeat the same camera_movement more than
-twice in a row.
-
-ZOOM DISCIPLINE (hard budget, not a suggestion): at most 1 in 4 shots may use a zoom-in-family
-movement (push_in/crash_zoom/zoom_in/snap_zoom/dolly_in) or extreme_close_up - never two in a
-row. At least 1 in 4 shots must be "wide" or "establishing", spread through the video, not
-clustered at the start.
-
-SOUND: "music_mood" - describe a thriller-movie score arc (restrained start, building
-intensity, percussive climax at the biggest reveal, resolving). For each shot, "sfx_cue" -
-both dramatic sounds (alerts, crashes, crowd reactions) and ambient/atmospheric sound
-(keyboard clicks, servers humming, wind, footsteps, notification pings) - aim for at least
-half of all shots to carry some cue; leave empty only where truly no sound would be audible.
-
-Return ONLY valid JSON, no markdown fences, in this exact format:
-{{
-  "setting_and_characters": "...",
-  "has_recurring_person": false,
-  "narration_text": "...",
-  "music_mood": "...",
-  "shot_list": [
-    {{
-      "shot_number": 1,
-      "visual_description": "...",
-      "narration_excerpt": "...",
-      "shot_type": "wide",
-      "camera_movement": "push_in",
-      "camera_reason": "...",
-      "lens_effect": "none",
-      "sfx_cue": ""
-    }}
-  ]
-}}
-Include between {MIN_SHOTS} and {MAX_SHOTS} shots covering the full narration."""
-
-    last_reason = None
-    for attempt in range(MAX_GENERATION_ATTEMPTS):
-        raw = call_gemini(prompt)
-        try:
-            parsed = extract_json(raw)
-        except (ValueError, json.JSONDecodeError) as e:
-            last_reason = f"JSON parse failed: {e}"
-            print(f"Attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS} failed - {last_reason}")
-            continue
-        is_valid, result = validate_and_normalize(parsed)
-        if is_valid:
-            return result
-        last_reason = result
-        print(f"Attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS} failed - {last_reason}")
-
-    raise RuntimeError(f"Script generation failed after {MAX_GENERATION_ATTEMPTS} attempts. Last reason: {last_reason}")
+def _supabase_request(method, path, body=None):
+    url = f"{SUPABASE_URL}/rest/v1/{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    })
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read()
+        return json.loads(raw) if raw.strip() else None
 
 
-def save_to_pipeline(headline, result):
-    payload = {
+def insert_pipeline_row(headline, narration, has_recurring_person, total_shots):
+    row = {
         "title": headline["title"],
-        "source": headline.get("source", ""),
         "link": headline.get("link", ""),
-        "script": result["narration_text"],
-        "shot_list": result["shot_list"],
-        "setting_and_characters": result["setting_and_characters"],
-        "has_recurring_person": result["has_recurring_person"],
-        "music_mood": result["music_mood"],
-        "video_urls": [],
-        "video_next_index": 0,
-        "status": "scripted",
+        "source": headline.get("source", ""),
+        "narration_full": narration,
+        "total_shots": total_shots,
+        "shots_completed": 0,
+        "generation_status": "shots_generating",
+        "status": "video_generated",  # legacy column, kept in sync; shot generation happens next stage
     }
-    resp = requests.post(
-        f"{SUPABASE_URL}/rest/v1/video_pipeline",
-        headers={**HEADERS, "Prefer": "return=representation"},
-        json=payload,
-        timeout=30,
-    )
-    if resp.status_code >= 400:
-        raise RuntimeError(f"Failed to save script to video_pipeline: {resp.status_code} {resp.text}")
-    print(f"Saved script to video_pipeline: {resp.json()[0]['id']}")
+    result = _supabase_request("POST", "video_pipeline", row)
+    return result[0]["id"]
 
 
-def main():
-    headline = load_headline()
-    if not headline:
-        print("No headline found in research/latest_headlines.json. Nothing to do.")
-        return
+def insert_shots(pipeline_id, shots):
+    rows = [
+        {"pipeline_id": pipeline_id, "shot_number": i + 1, "scene_description": s, "status": "pending"}
+        for i, s in enumerate(shots)
+    ]
+    _supabase_request("POST", "video_shots", rows)
 
-    print(f"Writing long-form script for: {headline['title']}")
-    result = generate_script(headline)
-    save_to_pipeline(headline, result)
-    print(f"Done. {len(result['shot_list'])} shots, {len(result['narration_text'].split())} words.")
+
+def generate_scripts(headlines_path="research/latest_headlines.json"):
+    with open(headlines_path) as f:
+        headlines = json.load(f)
+    for h in headlines:
+        prompt = PROMPT_TEMPLATE.format(
+            title=h["title"], summary=h["summary"],
+            word_count=TARGET_WORD_COUNT, shot_count=TARGET_SHOT_COUNT,
+        )
+        try:
+            raw = call_gemini(prompt)
+            raw = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            parsed = json.loads(raw)
+            shots = parsed["shots"]
+            pipeline_id = insert_pipeline_row(
+                h, parsed["narration"], bool(parsed.get("has_recurring_person", False)), len(shots)
+            )
+            insert_shots(pipeline_id, shots)
+            print(f"Created pipeline row {pipeline_id} for '{h['title']}' with {len(shots)} shots.")
+        except Exception as e:
+            print(f"Failed on {h['title']}: {e}")
 
 
 if __name__ == "__main__":
-    main()
+    generate_scripts()
