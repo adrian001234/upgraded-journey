@@ -22,6 +22,13 @@ chance on some shots and failed on others (e.g. a 3.2s shot at 24fps =
 76 frames, not a valid 8n+1 value). Now rounds to the nearest valid
 8n+1 frame count instead.
 
+RETRY LOGIC (2026-08-05): previously any failure (Agnes error, bad data,
+timeout) permanently marked the row status='failed' with no automatic
+retry - a stuck row just sat there until a human noticed and manually
+reset it. Now failures requeue the row back to status='narrated' (so
+the next run picks it up again) up to RETRY_LIMIT times, tracked via a
+retry_count column, before giving up and marking it permanently failed.
+
 SCOPE NOTE: this does NOT port Marius's character-reference/continuity-
 anchor chaining, SFX, or background-music layering - those are feature
 additions, not part of this schema-consistency fix. Shots are generated
@@ -63,6 +70,8 @@ POLL_INTERVAL = 10
 
 VIDEO_CLIPS_BUCKET = "video_clips"
 
+RETRY_LIMIT = 3
+
 
 def _supabase_request(method, path, body=None):
     url = f"{SUPABASE_URL}/rest/v1/{path}"
@@ -86,9 +95,17 @@ def get_next_narrated_row():
     return rows[0] if rows else None
 
 
-def mark_failed(row_id, reason):
-    print(f"Marking row {row_id} failed: {reason}")
-    _supabase_request("PATCH", f"video_pipeline?id=eq.{row_id}", {"status": "failed"})
+def mark_failed(row_id, reason, retry_count):
+    if retry_count < RETRY_LIMIT:
+        next_count = retry_count + 1
+        print(f"Row {row_id} failed (attempt {next_count}/{RETRY_LIMIT}): {reason}. Requeuing as 'narrated'.")
+        _supabase_request("PATCH", f"video_pipeline?id=eq.{row_id}", {
+            "status": "narrated",
+            "retry_count": next_count,
+        })
+    else:
+        print(f"Row {row_id} failed permanently after {RETRY_LIMIT} attempts: {reason}")
+        _supabase_request("PATCH", f"video_pipeline?id=eq.{row_id}", {"status": "failed"})
 
 
 def frames_for_duration(duration_seconds, frame_rate=FRAME_RATE):
@@ -186,6 +203,7 @@ def main():
         return
 
     row_id = row["id"]
+    retry_count = row.get("retry_count") or 0
     shot_list = row.get("shot_list")
     if isinstance(shot_list, str):
         shot_list = json.loads(shot_list)
@@ -194,10 +212,10 @@ def main():
         shot_durations = json.loads(shot_durations)
 
     if not shot_list:
-        mark_failed(row_id, "no shot_list on a 'narrated' row")
+        mark_failed(row_id, "no shot_list on a 'narrated' row", retry_count)
         return
     if not shot_durations or len(shot_durations) != len(shot_list):
-        mark_failed(row_id, f"shot_durations missing or length mismatch ({len(shot_durations or [])} vs {len(shot_list)} shots)")
+        mark_failed(row_id, f"shot_durations missing or length mismatch ({len(shot_durations or [])} vs {len(shot_list)} shots)", retry_count)
         return
 
     print(f"Generating {len(shot_list)} shots for pipeline row {row_id}...")
@@ -215,7 +233,7 @@ def main():
             os.remove(local_path)
             video_urls.append(clip_url)
         except Exception as e:
-            mark_failed(row_id, f"shot {i + 1}/{len(shot_list)} failed: {e}")
+            mark_failed(row_id, f"shot {i + 1}/{len(shot_list)} failed: {e}", retry_count)
             return
 
     mark_video_complete(row_id, video_urls)
