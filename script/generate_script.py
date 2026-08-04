@@ -11,15 +11,19 @@ video needs 40-50+ shots, which cannot all render in a single Actions run.
 New design: this stage now does ONLY the writing (Gemini call), producing
 a full long-form narration + a full shot list. It writes the narration to
 video_pipeline.narration_full and inserts every shot as its own row in
-video_shots with status='pending'. The separate video-generation stage
-(next to be rewritten) pulls ONE pending shot per run, renders it via
-Agnes, and exits - so a rate-limit hit just pauses progress on that video
-instead of failing the whole thing. generation_status moves
-scripting -> shots_generating as soon as this stage completes.
+video_shots with status='pending'. The video-generation stage pulls ONE
+pending shot per run, renders it via Agnes, and exits - so a rate-limit
+hit just pauses progress on that video instead of failing the whole thing.
+Once video-generation finishes the last shot, it aggregates all shot URLs
+onto this pipeline row and flips status to 'video_complete' - the exact
+trigger the existing, unchanged assemble.py already polls for.
+
+FIXED (2026-08-04): this row must start at a status assemble.py will never
+mistake for its own output - originally mistakenly set to "video_generated"
+(assemble.py's OUTPUT status), corrected to "shots_pending" here.
 """
 import json
 import os
-import re
 import urllib.request
 import urllib.error
 
@@ -118,7 +122,7 @@ def insert_pipeline_row(headline, narration, has_recurring_person, total_shots):
         "total_shots": total_shots,
         "shots_completed": 0,
         "generation_status": "shots_generating",
-        "status": "video_generated",  # legacy column, kept in sync; shot generation happens next stage
+        "status": "shots_pending",
     }
     result = _supabase_request("POST", "video_pipeline", row)
     return result[0]["id"]
