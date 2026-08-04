@@ -5,10 +5,21 @@ Selects the most recent headline that hasn't already been processed
 (checked against the Supabase video_pipeline table).
 No API key required for RSS; Supabase credentials are optional but
 recommended to avoid re-publishing the same story.
+
+FIXED (2026-08-04): RSS summaries were passed to the script stage as raw,
+unsanitized text. Some feeds (TechCrunch, Ars Technica, etc.) embed HTML,
+<code>/<pre> blocks, or literal code snippets inside the summary excerpt
+for programming-related stories. That raw text was going straight into the
+Gemini prompt, and Gemini would sometimes quote the code verbatim into the
+narration - which the TTS stage then read aloud word-for-word, producing
+a video where the narrator reads Python syntax mid-story. Now every
+summary is HTML-stripped, code-block-stripped, and length-capped before
+it's saved, so nothing but plain prose ever reaches the script stage.
 """
 import feedparser
 import json
 import os
+import re
 import urllib.request
 import urllib.parse
 from datetime import datetime, timezone
@@ -25,6 +36,25 @@ FEEDS = {
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
+
+# Matches <pre>...</pre> and <code>...</code> blocks (code snippets embedded
+# in the RSS excerpt), including multi-line content, before the general tag strip.
+CODE_BLOCK_RE = re.compile(r"<(pre|code)[^>]*>.*?</\1>", re.DOTALL | re.IGNORECASE)
+HTML_TAG_RE = re.compile(r"<[^>]+>")
+MAX_SUMMARY_CHARS = 600
+
+
+def _clean_summary(raw_summary):
+    """Strips embedded code blocks, then all remaining HTML tags, collapses
+    whitespace, and caps length - so only plain prose reaches the script stage."""
+    if not raw_summary:
+        return ""
+    text = CODE_BLOCK_RE.sub(" ", raw_summary)
+    text = HTML_TAG_RE.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > MAX_SUMMARY_CHARS:
+        text = text[:MAX_SUMMARY_CHARS].rsplit(" ", 1)[0] + "..."
+    return text
 
 
 def _parse_date(entry):
@@ -71,7 +101,7 @@ def fetch_headlines(limit_per_source=5):
             results.append({
                 "source": source_name,
                 "title": entry.get("title", ""),
-                "summary": entry.get("summary", ""),
+                "summary": _clean_summary(entry.get("summary", "")),
                 "link": entry.get("link", ""),
                 "published": entry.get("published", ""),
                 "fetched_at": datetime.utcnow().isoformat(),
