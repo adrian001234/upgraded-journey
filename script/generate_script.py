@@ -9,6 +9,11 @@ where a sound effect should play (e.g. "The rocket [SFX: engine roar]
 lifted off"). The narration stage resolves these tags to timestamps
 using word-level Whisper alignment, then layers matching sound effects
 in during assembly.
+
+FIXED (2026-08-04): added an explicit instruction forbidding literal code,
+syntax, or programming jargon in the narration - belt-and-suspenders on
+top of the research-stage fix that now strips code out of RSS summaries
+before they ever reach this prompt.
 """
 import json
 import os
@@ -28,6 +33,7 @@ Write THREE separate things:
    - PAYOFF (final 1-2 sentences): deliver the twist or the stakes in a single punchy line that lands hard and re-contextualizes everything before it — never a flat summary. The payoff MUST reuse the single most specific, surprising detail from the headline/summary (a number, a name, a timeframe, an outcome) — never a generic restatement of "this is concerning" or "this changes everything."
    - FINAL LINE: fold the call-to-action into the payoff's energy by explicitly referencing the specific twist or detail just delivered — not a generic urgency line. Example of what NOT to do: "Subscribe now, because the race to fake reality is only getting faster" (this could follow almost any tech story and doesn't call back to what actually happened). Example of what TO do instead: reference the exact specific event ("...pulled in under 24 hours — subscribe, because whatever they try next probably won't last much longer either"). The CTA must fail a test: could this exact sentence be pasted onto a different, unrelated story and still make sense? If yes, rewrite it until it couldn't.
    Read the whole thing out loud in your head before finalizing — if any sentence would make a real person tap away, rewrite it.
+   NEVER OUTPUT CODE: even if the headline or summary is about programming, software, or a technical tool, the narration must ONLY ever be plain spoken English describing what happened and why it matters — never literal code, syntax, command-line text, file paths, variable names, or function calls read as if spoken aloud. Describe technical concepts in plain language a general audience would understand, never quote source material verbatim if it contains code or markup.
    SOUND TAGGING: Wherever the narration describes a concrete, audible event (an explosion, a vehicle passing, a crowd reacting, a machine starting up, a phone ringing, footsteps, a crash, applause, etc.), insert an inline tag directly at that point in the text: [SFX: short sound description]. Only tag real diegetic sounds implied by the story content — never tag abstract concepts, emotions, or generic transitions. Most scripts will have 1-4 tags; a calm, data-driven story may have zero. Do not force tags where no real sound event exists. Tags must sit inline in the narration text exactly where the sound happens, e.g.: "The rocket [SFX: deep engine roar] tore off the pad in under three seconds."
    QUOTE TAGGING: If the narration includes a direct quote from a named person (e.g. the headline/summary attributes an actual quoted statement to someone), wrap ONLY that quoted portion in [VOICE:quote]...[/VOICE] tags, e.g.: He said [VOICE:quote]we had no idea it would happen this fast[/VOICE]. Only tag genuine quoted speech attributed to a specific person in the source material — never invent a quote, and never tag paraphrased or indirect speech.
 2. HAS_RECURRING_PERSON: true only if the headline/summary is actually about a specific, named individual whose face or actions are central to the story (a founder, a scientist, a public figure). false for abstract, statistical, institutional, or trend-based stories (research findings, market data, company-wide behavior, policy, industry patterns) — these should be shown through environments, objects, and data, not an invented person.
