@@ -1,36 +1,57 @@
 """
-TechPulse - Video Stage
-Generates one real AI video clip per scene via Agnes AI (agnes-video-v2.0).
-For stories with a genuine recurring person (has_recurring_person=true),
-uses image-to-video anchoring for character/scene continuity: scene 0 builds
-a one-time character reference image, and every scene after anchors to the
-last frame of the previous scene's clip - same architecture as Marius/Erased.
-For abstract/data-driven stories (has_recurring_person=false), NO character
-reference or cross-scene anchoring is used at all - each scene generates
-independently from its own text so shots vary instead of locking onto one
-invented, static figure for the whole video.
+TechPulse - Video Stage (long-form, resumable)
+Pulls the next Supabase video_pipeline row with status='narrated', and
+generates AI video clips shot-by-shot from its shot_list (60-90 shots),
+checkpointing progress (video_urls, video_next_index) into Supabase after
+EVERY shot so a killed/timed-out run picks up exactly where it left off on
+the next scheduled invocation - ported from the proven pattern in
+marius-command-center's video generation stage, since Agnes AI is
+rate-limited per-minute and a single CI run cannot generate 60-90 shots
+in one pass.
+
+For has_recurring_person=true stories: a one-time character reference
+image is generated from setting_and_characters (once, cached on the row
+as character_reference_url), then every shot after anchors to the last
+frame of the previous shot's clip for continuity - same chaining
+architecture as Marius/Erased.
+
+For has_recurring_person=false stories: no character reference or
+cross-shot anchoring - each shot generates independently from its own
+visual_description so wide/data/environment shots vary instead of
+locking onto one invented static figure.
 """
 import json
 import os
 import time
 import subprocess
-import urllib.request
-import urllib.error
+import requests
 
 AGNES_API_KEY = os.environ["AGNES_API_KEY"]
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_ANON_KEY = os.environ["SUPABASE_ANON_KEY"]
+
 AGNES_BASE = "https://apihub.agnes-ai.com/v1"
 AGNES_POLL_URL = "https://apihub.agnes-ai.com/agnesapi"
 AGNES_IMAGE_URL = f"{AGNES_BASE}/images/generations"
+
+HEADERS = {
+    "apikey": SUPABASE_ANON_KEY,
+    "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+    "Content-Type": "application/json",
+}
+VIDEO_CLIPS_BUCKET = "video_clips"
 
 WIDTH, HEIGHT = 1280, 720
 FRAME_RATE = 24
 MIN_FRAMES = 49
 MAX_FRAMES = 169
-CLIP_SECONDS = 5.0  # per-scene target; Assembly stage trims/extends to the real per-segment duration
+DEFAULT_SHOT_SECONDS = 4.0  # fallback if a shot has no measured duration yet
 
-MAX_SCENE_RETRIES = 3
+MAX_SHOT_RETRIES = 3
 AGNES_RETRYABLE = {429, 500, 502, 503, 504}
 RETRY_BACKOFF_BASE = 15
+
+RUN_TIME_BUDGET_SECONDS = 11 * 60  # leaves headroom inside a scheduled run before GitHub kills it
 
 QUALITY_GUARD = ("shot on film, natural film grain, vivid saturated color, no sepia tone, "
                   "no muted documentary color grading, no artificial CGI look")
@@ -47,39 +68,32 @@ def agnes_headers():
     return {"Authorization": f"Bearer {AGNES_API_KEY}", "Content-Type": "application/json"}
 
 
-def build_prompt(scene_text, use_fallback=False):
-    is_dark = any(k in scene_text.lower() for k in DARK_SCENE_KEYWORDS)
+def build_prompt(shot, setting_and_characters, use_fallback=False):
+    visual = shot.get("visual_description", "")
+    is_dark = any(k in visual.lower() for k in DARK_SCENE_KEYWORDS)
     lighting = "moody, intentionally low-light scene as part of the story" if is_dark else LIGHTING_CUE_BRIGHT
     if use_fallback:
-        return f"{lighting}, {QUALITY_GUARD}, cinematic documentary shot"
-    return f"{lighting}, {QUALITY_GUARD}, {scene_text}"
+        return f"{lighting}, {QUALITY_GUARD}, cinematic documentary shot, {setting_and_characters}"
+    movement = shot.get("camera_movement", "static").replace("_", " ")
+    return f"{lighting}, {QUALITY_GUARD}, {setting_and_characters}. {visual}. Camera: {movement}."
 
 
 def http_post_json(url, payload, headers, timeout=60):
-    body = json.dumps(payload).encode()
-    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        try:
-            data = json.loads(e.read() or b"{}")
-        except Exception:
-            data = {}
-        return e.code, data
+        data = resp.json()
+    except Exception:
+        data = {}
+    return resp.status_code, data
 
 
 def http_get_json(url, headers, timeout=30):
-    req = urllib.request.Request(url, headers=headers, method="GET")
+    resp = requests.get(url, headers=headers, timeout=timeout)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        try:
-            data = json.loads(e.read() or b"{}")
-        except Exception:
-            data = {}
-        return e.code, data
+        data = resp.json()
+    except Exception:
+        data = {}
+    return resp.status_code, data
 
 
 def create_video_task(prompt, num_frames, image_url=None):
@@ -126,15 +140,14 @@ def poll_video_task(video_id, max_wait=280, interval=10):
 
 
 def download(url, out_path):
-    req = urllib.request.Request(url, headers={"User-Agent": "TechPulse/1.0"})
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        data = resp.read()
+    resp = requests.get(url, headers={"User-Agent": "TechPulse/1.0"}, timeout=120)
+    resp.raise_for_status()
     with open(out_path, "wb") as f:
-        f.write(data)
+        f.write(resp.content)
 
 
-def generate_character_reference(anchor_text, out_path):
-    prompt = (f"{anchor_text}, character reference portrait, full figure visible, "
+def generate_character_reference(setting_and_characters, out_path):
+    prompt = (f"{setting_and_characters}, character reference portrait, full figure visible, "
               f"neutral pose, clear face and clothing detail, {LIGHTING_CUE_BRIGHT}, {QUALITY_GUARD}")
     status, data = http_post_json(AGNES_IMAGE_URL,
         {"model": "agnes-image-2.1-flash", "prompt": prompt, "size": f"{WIDTH}x{HEIGHT}",
@@ -156,120 +169,173 @@ def extract_last_frame(video_path, out_png):
     return out_png
 
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
-ANCHOR_BUCKET = "video_clips"
-
-
-def upload_to_supabase(local_path):
-    """Agnes needs a public image URL for image-to-video anchoring. Uploads
-    the extracted frame / reference image to Supabase Storage (same project
-    already used by tracking/save_to_supabase.py), matching the approach
-    used in the Marius pipeline. Replaces the old tmpfiles.org upload,
-    which started returning 403 Forbidden on every request."""
-    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-        print("  SUPABASE_URL/SUPABASE_ANON_KEY not set, continuing without a continuity anchor.")
-        return None
+def upload_to_supabase(local_path, dest_subdir, content_type):
     with open(local_path, "rb") as f:
         file_bytes = f.read()
-    dest_name = f"anchors/{os.path.basename(local_path)}"
-    url = f"{SUPABASE_URL}/storage/v1/object/{ANCHOR_BUCKET}/{dest_name}"
-    req = urllib.request.Request(
-        url, data=file_bytes, method="POST",
+    dest_name = f"{dest_subdir}/{os.path.basename(local_path)}"
+    url = f"{SUPABASE_URL}/storage/v1/object/{VIDEO_CLIPS_BUCKET}/{dest_name}"
+    resp = requests.post(
+        url, data=file_bytes,
         headers={
             "apikey": SUPABASE_ANON_KEY,
             "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-            "Content-Type": "image/png",
+            "Content-Type": content_type,
             "x-upsert": "true",
         },
+        timeout=120,
     )
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            resp.read()
-        return f"{SUPABASE_URL}/storage/v1/object/public/{ANCHOR_BUCKET}/{dest_name}"
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")
-        print(f"  Supabase anchor upload failed ({e.code}), continuing without a continuity anchor: {body}")
+    if resp.status_code >= 400:
+        print(f"  Supabase upload failed ({resp.status_code}): {resp.text}")
         return None
-    except Exception as e:
-        print(f"  Supabase anchor upload failed, continuing without a continuity anchor: {e}")
-        return None
+    return f"{SUPABASE_URL}/storage/v1/object/public/{VIDEO_CLIPS_BUCKET}/{dest_name}"
 
 
-def generate_scene_clip(scene_text, out_path, anchor_image_url=None):
-    num_frames = round_to_valid_frames(int(CLIP_SECONDS * FRAME_RATE))
+def get_next_narrated_row():
+    resp = requests.get(
+        f"{SUPABASE_URL}/rest/v1/video_pipeline?status=eq.narrated&order=created_at.asc&limit=1",
+        headers=HEADERS, timeout=30,
+    )
+    resp.raise_for_status()
+    rows = resp.json()
+    return rows[0] if rows else None
+
+
+def save_progress(row_id, video_urls, video_next_index, character_reference_url=None, status=None):
+    payload = {"video_urls": video_urls, "video_next_index": video_next_index}
+    if character_reference_url is not None:
+        payload["character_reference_url"] = character_reference_url
+    if status:
+        payload["status"] = status
+    resp = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/video_pipeline?id=eq.{row_id}",
+        headers=HEADERS, json=payload, timeout=30,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Failed to save video progress ({resp.status_code}): {resp.text}")
+
+
+def generate_one_shot(shot, setting_and_characters, out_path, anchor_image_url, duration_seconds):
+    num_frames = round_to_valid_frames(int(max(duration_seconds, 1.0) * FRAME_RATE))
     num_frames = max(MIN_FRAMES, min(MAX_FRAMES, num_frames))
-    for attempt in range(1, MAX_SCENE_RETRIES + 1):
+    for attempt in range(1, MAX_SHOT_RETRIES + 1):
         try:
-            prompt = build_prompt(scene_text, use_fallback=False)
+            prompt = build_prompt(shot, setting_and_characters, use_fallback=False)
             try:
                 video_id = create_video_task(prompt, num_frames, image_url=anchor_image_url)
             except ValueError:
                 print("  Content policy rejection - retrying with generic fallback prompt")
-                fallback_prompt = build_prompt(scene_text, use_fallback=True)
+                fallback_prompt = build_prompt(shot, setting_and_characters, use_fallback=True)
                 video_id = create_video_task(fallback_prompt, num_frames, image_url=anchor_image_url)
             video_url = poll_video_task(video_id)
             download(video_url, out_path)
             return True
         except Exception as e:
-            print(f"  Attempt {attempt}/{MAX_SCENE_RETRIES} failed: {e}")
-            if attempt < MAX_SCENE_RETRIES:
+            print(f"  Attempt {attempt}/{MAX_SHOT_RETRIES} failed: {e}")
+            if attempt < MAX_SHOT_RETRIES:
                 time.sleep(RETRY_BACKOFF_BASE * attempt)
     return False
 
 
-def generate_videos(scripts_path="script/latest_scripts.json", out_path="video/latest_videos.json"):
-    with open(scripts_path) as f:
-        scripts = json.load(f)
+def main():
+    row = get_next_narrated_row()
+    if not row:
+        print("No 'narrated' rows found. Nothing to do.")
+        return
+
+    row_id = row["id"]
+    shot_list = row.get("shot_list") or []
+    if isinstance(shot_list, str):
+        shot_list = json.loads(shot_list)
+    shot_durations = row.get("shot_durations") or []
+    if isinstance(shot_durations, str):
+        shot_durations = json.loads(shot_durations)
+    setting_and_characters = row.get("setting_and_characters") or ""
+    has_person = bool(row.get("has_recurring_person", False))
+    video_urls = row.get("video_urls") or []
+    if isinstance(video_urls, str):
+        video_urls = json.loads(video_urls)
+    next_index = row.get("video_next_index") or 0
+    character_reference_url = row.get("character_reference_url")
+
+    total_shots = len(shot_list)
+    print(f"Row {row_id}: {total_shots} shots, resuming from index {next_index}, "
+          f"{len(video_urls)} clips already saved.")
+
+    if total_shots == 0:
+        print("shot_list is empty on this row - marking failed.")
+        save_progress(row_id, video_urls, next_index, status="failed")
+        return
 
     os.makedirs("video/clips", exist_ok=True)
-    videos = []
-    for s_idx, s in enumerate(scripts):
-        scenes = s["scenes"]
-        clip_paths = []
-        has_person = bool(s.get("has_recurring_person", False))
 
-        anchor_url = None
+    if has_person and not character_reference_url:
+        ref_path = "video/clips/character_reference.png"
+        remote_url = generate_character_reference(setting_and_characters, ref_path)
+        if remote_url:
+            download(remote_url, ref_path)
+            uploaded = upload_to_supabase(ref_path, "anchors", "image/png")
+            character_reference_url = uploaded or remote_url
+            save_progress(row_id, video_urls, next_index, character_reference_url=character_reference_url)
+            print("Character reference ready and saved.")
+        else:
+            print("No character reference generated - shots will chain without an initial anchor.")
+
+    anchor_url = character_reference_url if has_person else None
+    # If resuming mid-video, chain from the last saved clip instead of the character ref.
+    if has_person and next_index > 0 and video_urls:
+        anchor_url = video_urls[-1]
+
+    start_time = time.time()
+    while next_index < total_shots:
+        if time.time() - start_time > RUN_TIME_BUDGET_SECONDS:
+            print(f"Time budget reached at shot {next_index}/{total_shots} - "
+                  f"checkpoint saved, next scheduled run will resume.")
+            break
+
+        shot = shot_list[next_index]
+        duration = shot_durations[next_index] if next_index < len(shot_durations) else DEFAULT_SHOT_SECONDS
+        clip_path = f"video/clips/shot_{row_id}_{next_index}.mp4"
+
+        print(f"Shot {next_index + 1}/{total_shots} ({duration:.1f}s target)...")
+        ok = generate_one_shot(shot, setting_and_characters, clip_path,
+                                anchor_image_url=anchor_url, duration_seconds=duration)
+        if not ok:
+            print(f"Giving up on shot {next_index} after retries - marking row failed.")
+            save_progress(row_id, video_urls, next_index, status="failed")
+            return
+
+        clip_url = upload_to_supabase(clip_path, "clips", "video/mp4")
+        if not clip_url:
+            print(f"Could not upload shot {next_index} to Supabase - marking row failed.")
+            save_progress(row_id, video_urls, next_index, status="failed")
+            return
+
+        video_urls.append(clip_url)
+        next_index += 1
+
         if has_person:
-            ref_path = f"video/clips/ref_{s_idx}.png"
-            anchor_url = generate_character_reference(scenes[0], ref_path)
-            if anchor_url:
-                print(f"  Character reference ready for: {s['title']}")
-            else:
-                print(f"  No character reference for: {s['title']} - first scene will generate blind.")
-        else:
-            print(f"  No recurring person for: {s['title']} - scenes will generate independently, no anchor chain.")
+            try:
+                last_frame_png = f"video/clips/lastframe_{row_id}_{next_index}.png"
+                extract_last_frame(clip_path, last_frame_png)
+                new_anchor = upload_to_supabase(last_frame_png, "anchors", "image/png")
+                if new_anchor:
+                    anchor_url = new_anchor
+                if os.path.exists(last_frame_png):
+                    os.remove(last_frame_png)
+            except Exception as e:
+                print(f"  Could not extract continuity anchor from shot {next_index - 1}, "
+                      f"next shot generates blind: {e}")
 
-        for i, scene in enumerate(scenes):
-            clip_path = f"video/clips/clip_{s_idx}_{i}.mp4"
-            ok = generate_scene_clip(scene, clip_path, anchor_image_url=anchor_url)
-            if not ok:
-                print(f"  Giving up on scene {i} for: {s['title']}")
-                break
-            clip_paths.append(clip_path)
+        if os.path.exists(clip_path):
+            os.remove(clip_path)
 
-            if has_person:
-                try:
-                    last_frame_png = f"video/clips/lastframe_{s_idx}_{i}.png"
-                    extract_last_frame(clip_path, last_frame_png)
-                    new_anchor = upload_to_supabase(last_frame_png)
-                    if new_anchor:
-                        anchor_url = new_anchor
-                    if os.path.exists(last_frame_png):
-                        os.remove(last_frame_png)
-                except Exception as e:
-                    print(f"  Could not extract continuity anchor from scene {i}, next scene generates blind: {e}")
+        save_progress(row_id, video_urls, next_index)
+        print(f"Checkpoint saved: {next_index}/{total_shots} shots done.")
 
-        if len(clip_paths) == len(scenes):
-            videos.append({**s, "video_urls": clip_paths})
-            print(f"Generated {len(clip_paths)}/{len(scenes)} clips for: {s['title']}")
-        else:
-            print(f"SKIPPING '{s['title']}': only {len(clip_paths)}/{len(scenes)} scenes succeeded")
-
-    with open(out_path, "w") as f:
-        json.dump(videos, f, indent=2)
-    print(f"Saved {len(videos)} videos to {out_path}")
+    if next_index >= total_shots:
+        save_progress(row_id, video_urls, next_index, status="video_complete")
+        print(f"Row {row_id}: all {total_shots} shots complete. Status -> video_complete.")
 
 
 if __name__ == "__main__":
-    generate_videos()
+    main()
