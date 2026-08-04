@@ -12,6 +12,12 @@ tracking stage inserting a NEW row) - now there is only ever one row per
 video, created once by the script stage and updated in place by every
 stage after, so nothing downstream ever has to match rows back together
 by title/source text.
+
+RETRY LOGIC (2026-08-05): previously any failure permanently marked the
+row status='failed' with no automatic retry. Now failures requeue the
+row back to status='video_complete' (so the next run picks it up again)
+up to RETRY_LIMIT times, tracked via a retry_count column, before giving
+up and marking it permanently failed.
 """
 import json
 import os
@@ -40,6 +46,8 @@ AMBIENT_TRACKS = [
 ]
 AMBIENT_VOLUME = 0.12
 
+RETRY_LIMIT = 3
+
 
 def get_next_video_complete_row():
     resp = requests.get(
@@ -51,12 +59,20 @@ def get_next_video_complete_row():
     return rows[0] if rows else None
 
 
-def mark_failed(row_id, reason):
-    print(f"  Marking row {row_id} failed: {reason}")
-    requests.patch(
-        f"{SUPABASE_URL}/rest/v1/video_pipeline?id=eq.{row_id}",
-        headers=HEADERS, json={"status": "failed"}, timeout=30,
-    )
+def mark_failed(row_id, reason, retry_count):
+    if retry_count < RETRY_LIMIT:
+        next_count = retry_count + 1
+        print(f"  Row {row_id} failed (attempt {next_count}/{RETRY_LIMIT}): {reason}. Requeuing as 'video_complete'.")
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/video_pipeline?id=eq.{row_id}",
+            headers=HEADERS, json={"status": "video_complete", "retry_count": next_count}, timeout=30,
+        )
+    else:
+        print(f"  Row {row_id} failed permanently after {RETRY_LIMIT} attempts: {reason}")
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/video_pipeline?id=eq.{row_id}",
+            headers=HEADERS, json={"status": "failed"}, timeout=30,
+        )
 
 
 def download(url, out_path):
@@ -181,6 +197,7 @@ def main():
         return
 
     row_id = row["id"]
+    retry_count = row.get("retry_count") or 0
     title = row.get("title", "untitled")
     video_urls = row.get("video_urls") or []
     if isinstance(video_urls, str):
@@ -191,10 +208,10 @@ def main():
     narration_url = row.get("narration_url")
 
     if not video_urls:
-        mark_failed(row_id, "no video_urls on a 'video_complete' row")
+        mark_failed(row_id, "no video_urls on a 'video_complete' row", retry_count)
         return
     if not narration_url:
-        mark_failed(row_id, "no narration_url on this row")
+        mark_failed(row_id, "no narration_url on this row", retry_count)
         return
 
     os.makedirs(FINAL_DIR, exist_ok=True)
@@ -251,7 +268,7 @@ def main():
                 os.remove(p)
 
     except Exception as e:
-        mark_failed(row_id, f"assembly exception: {e}")
+        mark_failed(row_id, f"assembly exception: {e}", retry_count)
 
 
 if __name__ == "__main__":
