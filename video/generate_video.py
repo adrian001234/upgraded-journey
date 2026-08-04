@@ -14,6 +14,14 @@ directly, sized to that shot's own entry in shot_durations - the exact
 values narration.py already computed from real narration audio, instead
 of a hardcoded 8s/shot guess.
 
+FRAME-COUNT FIX (2026-08-05): Agnes requires num_frames in the form
+8*n + 1 (its native video-diffusion chunking window) and returns HTTP 400
+on any other value. The previous version passed duration_seconds*FRAME_RATE
+truncated to an int with no regard for this constraint - this worked by
+chance on some shots and failed on others (e.g. a 3.2s shot at 24fps =
+76 frames, not a valid 8n+1 value). Now rounds to the nearest valid
+8n+1 frame count instead.
+
 SCOPE NOTE: this does NOT port Marius's character-reference/continuity-
 anchor chaining, SFX, or background-music layering - those are feature
 additions, not part of this schema-consistency fix. Shots are generated
@@ -83,13 +91,20 @@ def mark_failed(row_id, reason):
     _supabase_request("PATCH", f"video_pipeline?id=eq.{row_id}", {"status": "failed"})
 
 
+def frames_for_duration(duration_seconds, frame_rate=FRAME_RATE):
+    """Round to the nearest frame count Agnes accepts (must be 8*n + 1)."""
+    raw = duration_seconds * frame_rate
+    n = max(round((raw - 1) / 8), 1)
+    return 8 * n + 1
+
+
 def submit_agnes_task(prompt, duration_seconds):
     body = json.dumps({
         "model": AGNES_MODEL,
         "prompt": prompt,
         "height": HEIGHT,
         "width": WIDTH,
-        "num_frames": max(int(duration_seconds * FRAME_RATE), 1),
+        "num_frames": frames_for_duration(duration_seconds),
         "frame_rate": FRAME_RATE,
     }).encode()
     req = urllib.request.Request(AGNES_SUBMIT_URL, data=body, method="POST", headers=AGNES_HEADERS)
