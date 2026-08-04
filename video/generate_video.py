@@ -1,45 +1,59 @@
 """
-TechPulse - Video Generation Stage (LONG-FORM, RESUMABLE)
-Rewritten 2026-08-04 alongside generate_script.py for the move to long-form
-video, matching the resumable shot-by-shot pattern proven in Marius.
+TechPulse - Video Generation Stage (LONG-FORM)
+Rewritten 2026-08-05 to fix a schema mismatch with generate_script.py and
+narration/generate_narration.py.
 
-Old design: generated all 7 scenes in a single run via Agnes AI. That
-doesn't work for long-form because Agnes is rate-limited per-minute and a
-6-7 minute video has 40-50+ shots - far more than one run can render.
+SCHEMA FIX (2026-08-05): the 2026-08-04 version of this file read shots
+from a separate video_shots table (scene_description field) keyed off
+generation_status='shots_generating' - a schema that generate_script.py
+no longer writes and that has no connection to shot_durations computed
+by narration.py. This version instead pulls the oldest video_pipeline
+row with status='narrated' (set by generate_narration.py once real
+per-shot audio timing is known), and renders each shot in its shot_list
+directly, sized to that shot's own entry in shot_durations - the exact
+values narration.py already computed from real narration audio, instead
+of a hardcoded 8s/shot guess.
 
-New design: this script does ONE unit of work per invocation:
-  1. Find the oldest pipeline row still in 'shots_generating' status.
-  2. Pull its single oldest 'pending' shot from video_shots.
-  3. Render that one shot via Agnes AI.
-  4. Mark that shot 'generated', bump shots_completed on the pipeline row.
-  5. If that was the last shot, aggregate all shot video_urls +
-     shot_durations onto the pipeline row itself and flip status to
-     'video_complete' - the exact trigger assemble.py already polls for
-     (assemble.py itself needed NO changes; it was already built to
-     handle a variable number of shots this way).
-  6. Exit. The next cron tick repeats this for the next pending shot -
-     of this video, or the next video once this one's shots are done.
+SCOPE NOTE: this does NOT port Marius's character-reference/continuity-
+anchor chaining, SFX, or background-music layering - those are feature
+additions, not part of this schema-consistency fix. Shots are generated
+independently (text-to-video only), same as this file's previous
+version. Flagged separately since it affects visual consistency across
+shots on longer videos.
 
-This means a rate-limit failure on shot 23 of 45 just pauses progress;
-the next run retries shot 23 rather than losing the whole video.
-
-FIXED (2026-08-04): the first version of this file flipped
-generation_status to 'assembling' when shots finished - but assemble.py
-never reads generation_status; it polls the 'status' column for
-'video_complete' and expects video_urls/shot_durations arrays directly
-on the pipeline row. Corrected below.
+TIMEOUT RISK (unresolved, flagged not fixed): pipeline.yml runs this
+inside the same 20-minute job as every other stage, with all ~45 shots
+for a video generated sequentially in a single call to main(). At Agnes's
+typical per-clip generation+poll time this will not reliably fit for a
+45-shot long-form video inside the remaining time budget after
+research/script/narration already ran in the same job. Not addressed
+here - would need either a per-run shot budget + resume logic (the
+pattern Marius uses) or a separate workflow/timeout, both of which are
+scope decisions beyond this bug fix.
 """
 import json
 import os
-import time
 import urllib.request
 import urllib.error
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_ANON_KEY = os.environ["SUPABASE_ANON_KEY"]
 AGNES_API_KEY = os.environ["AGNES_API_KEY"]
-AGNES_URL = os.environ.get("AGNES_API_URL", "https://api.agnes.ai/v1/generate")
-SHOT_DURATION_SECONDS = 8
+
+AGNES_SUBMIT_URL = "https://apihub.agnes-ai.com/v1/videos"
+AGNES_POLL_URL = "https://apihub.agnes-ai.com/agnesapi"
+AGNES_MODEL = "agnes-video-v2.0"
+AGNES_HEADERS = {
+    "Authorization": f"Bearer {AGNES_API_KEY}",
+    "Content-Type": "application/json",
+}
+
+WIDTH, HEIGHT = 1280, 720
+FRAME_RATE = 24
+POLL_MAX_WAIT = 240
+POLL_INTERVAL = 10
+
+VIDEO_CLIPS_BUCKET = "video_clips"
 
 
 def _supabase_request(method, path, body=None):
@@ -56,104 +70,141 @@ def _supabase_request(method, path, body=None):
         return json.loads(raw) if raw.strip() else None
 
 
-def get_next_pipeline_row():
-    """Oldest pipeline row still generating shots."""
+def get_next_narrated_row():
     rows = _supabase_request(
         "GET",
-        "video_pipeline?generation_status=eq.shots_generating&order=created_at.asc&limit=1&select=*",
+        "video_pipeline?status=eq.narrated&order=created_at.asc&limit=1&select=*",
     )
     return rows[0] if rows else None
 
 
-def get_next_pending_shot(pipeline_id):
-    rows = _supabase_request(
-        "GET",
-        f"video_shots?pipeline_id=eq.{pipeline_id}&status=eq.pending&order=shot_number.asc&limit=1&select=*",
-    )
-    return rows[0] if rows else None
+def mark_failed(row_id, reason):
+    print(f"Marking row {row_id} failed: {reason}")
+    _supabase_request("PATCH", f"video_pipeline?id=eq.{row_id}", {"status": "failed"})
 
 
-def get_all_shot_urls(pipeline_id):
-    """Fetch every shot's video_url for this pipeline, in shot order."""
-    rows = _supabase_request(
-        "GET",
-        f"video_shots?pipeline_id=eq.{pipeline_id}&order=shot_number.asc&select=video_url,status",
-    )
-    return rows
-
-
-def render_shot_via_agnes(scene_description):
-    """Call Agnes AI to render a single clip for this shot."""
+def submit_agnes_task(prompt, duration_seconds):
     body = json.dumps({
-        "prompt": scene_description,
-        "duration_seconds": SHOT_DURATION_SECONDS,
-        "aspect_ratio": "9:16",
+        "model": AGNES_MODEL,
+        "prompt": prompt,
+        "height": HEIGHT,
+        "width": WIDTH,
+        "num_frames": max(int(duration_seconds * FRAME_RATE), 1),
+        "frame_rate": FRAME_RATE,
     }).encode()
-    req = urllib.request.Request(
-        AGNES_URL, data=body, method="POST",
-        headers={"Authorization": f"Bearer {AGNES_API_KEY}", "Content-Type": "application/json"},
-    )
+    req = urllib.request.Request(AGNES_SUBMIT_URL, data=body, method="POST", headers=AGNES_HEADERS)
     try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            result = json.loads(resp.read())
-            return result["video_url"]
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         error_body = e.read().decode(errors="replace")[:500]
-        raise RuntimeError(f"Agnes HTTP {e.code}: {error_body}") from e
+        raise RuntimeError(f"Agnes submit HTTP {e.code}: {error_body}") from e
+    video_id = data.get("video_id") or data.get("id")
+    if not video_id:
+        raise RuntimeError(f"Agnes submit response had no video_id: {data}")
+    return video_id
 
 
-def mark_shot_generated(shot_id, video_url):
-    _supabase_request("PATCH", f"video_shots?id=eq.{shot_id}", {"status": "generated", "video_url": video_url})
+def poll_agnes_task(video_id):
+    waited = 0
+    url = f"{AGNES_POLL_URL}?video_id={video_id}&model_name={AGNES_MODEL}"
+    while waited < POLL_MAX_WAIT:
+        req = urllib.request.Request(url, headers=AGNES_HEADERS)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode(errors="replace")[:500]
+            raise RuntimeError(f"Agnes poll HTTP {e.code}: {error_body}") from e
+        status = data.get("status")
+        if status == "completed":
+            for key in ("video_url", "url"):
+                val = data.get(key)
+                if isinstance(val, str) and val.startswith("http"):
+                    return val
+            raise RuntimeError(f"Agnes completed but no video URL found: {data}")
+        if status == "failed":
+            raise RuntimeError(f"Agnes generation failed: {data}")
+        import time
+        time.sleep(POLL_INTERVAL)
+        waited += POLL_INTERVAL
+    raise RuntimeError(f"Agnes generation timed out after {POLL_MAX_WAIT}s for video_id {video_id}")
 
 
-def mark_shot_pending_again(shot_id):
-    """Reset a failed shot back to pending so the next tick retries it, rather than skipping it permanently."""
-    _supabase_request("PATCH", f"video_shots?id=eq.{shot_id}", {"status": "pending"})
+def download_file(url, out_path):
+    urllib.request.urlretrieve(url, out_path)
+    return out_path
 
 
-def mark_shot_failed(shot_id):
-    _supabase_request("PATCH", f"video_shots?id=eq.{shot_id}", {"status": "failed"})
+def upload_clip(row_id, index, local_path):
+    dest_name = f"{row_id}/shot_{index:03d}.mp4"
+    with open(local_path, "rb") as f:
+        file_bytes = f.read()
+    req = urllib.request.Request(
+        f"{SUPABASE_URL}/storage/v1/object/{VIDEO_CLIPS_BUCKET}/{dest_name}",
+        data=file_bytes,
+        method="POST",
+        headers={
+            "apikey": SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+            "Content-Type": "video/mp4",
+            "x-upsert": "true",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        if resp.status >= 400:
+            raise RuntimeError(f"Clip upload failed ({resp.status})")
+    return f"{SUPABASE_URL}/storage/v1/object/public/{VIDEO_CLIPS_BUCKET}/{dest_name}"
 
 
-def bump_shots_completed(pipeline_id, new_count, total_shots):
-    update = {"shots_completed": new_count}
-    if new_count >= total_shots:
-        shots = get_all_shot_urls(pipeline_id)
-        video_urls = [s["video_url"] for s in shots if s["status"] == "generated"]
-        shot_durations = [SHOT_DURATION_SECONDS] * len(video_urls)
-        update["video_urls"] = video_urls
-        update["shot_durations"] = shot_durations
-        update["status"] = "video_complete"
-    _supabase_request("PATCH", f"video_pipeline?id=eq.{pipeline_id}", update)
+def mark_video_complete(row_id, video_urls):
+    _supabase_request("PATCH", f"video_pipeline?id=eq.{row_id}", {
+        "status": "video_complete",
+        "video_urls": video_urls,
+    })
 
 
 def main():
-    pipeline_row = get_next_pipeline_row()
-    if not pipeline_row:
-        print("No pipeline rows currently in shots_generating status. Nothing to do this run.")
+    row = get_next_narrated_row()
+    if not row:
+        print("No 'narrated' rows found. Nothing to do.")
         return
 
-    pipeline_id = pipeline_row["id"]
-    total_shots = pipeline_row["total_shots"]
-    shot = get_next_pending_shot(pipeline_id)
+    row_id = row["id"]
+    shot_list = row.get("shot_list")
+    if isinstance(shot_list, str):
+        shot_list = json.loads(shot_list)
+    shot_durations = row.get("shot_durations")
+    if isinstance(shot_durations, str):
+        shot_durations = json.loads(shot_durations)
 
-    if not shot:
-        print(f"Pipeline {pipeline_id}: no pending shots left, finalizing to video_complete.")
-        bump_shots_completed(pipeline_id, total_shots, total_shots)
+    if not shot_list:
+        mark_failed(row_id, "no shot_list on a 'narrated' row")
+        return
+    if not shot_durations or len(shot_durations) != len(shot_list):
+        mark_failed(row_id, f"shot_durations missing or length mismatch ({len(shot_durations or [])} vs {len(shot_list)} shots)")
         return
 
-    print(f"Pipeline {pipeline_id}: rendering shot {shot['shot_number']}/{total_shots}")
-    try:
-        video_url = render_shot_via_agnes(shot["scene_description"])
-        mark_shot_generated(shot["id"], video_url)
-        new_count = (pipeline_row.get("shots_completed") or 0) + 1
-        bump_shots_completed(pipeline_id, new_count, total_shots)
-        print(f"Shot {shot['shot_number']}/{total_shots} done. {total_shots - new_count} remaining.")
-    except Exception as e:
-        print(f"Shot {shot['shot_number']} failed this run, will retry next tick: {e}")
-        mark_shot_failed(shot["id"])
-        time.sleep(1)
-        mark_shot_pending_again(shot["id"])
+    print(f"Generating {len(shot_list)} shots for pipeline row {row_id}...")
+    video_urls = []
+    for i, shot in enumerate(shot_list):
+        prompt = shot.get("visual_description", "").strip()
+        duration = shot_durations[i]
+        print(f"  Shot {i + 1}/{len(shot_list)} (~{duration:.1f}s): {prompt[:80]!r}")
+        try:
+            video_id = submit_agnes_task(prompt, duration)
+            video_url = poll_agnes_task(video_id)
+            local_path = f"/tmp/shot_{row_id}_{i:03d}.mp4"
+            download_file(video_url, local_path)
+            clip_url = upload_clip(row_id, i, local_path)
+            os.remove(local_path)
+            video_urls.append(clip_url)
+        except Exception as e:
+            mark_failed(row_id, f"shot {i + 1}/{len(shot_list)} failed: {e}")
+            return
+
+    mark_video_complete(row_id, video_urls)
+    print(f"Row {row_id}: all {len(video_urls)} shots generated. Status -> video_complete.")
 
 
 if __name__ == "__main__":
