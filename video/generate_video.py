@@ -26,6 +26,33 @@ pattern proven in Marius:
 Frame-count fix (num_frames must be 8n+1) and Agnes endpoints are carried
 over unchanged from the 2026-08-05 schema-fix version of this file.
 
+RELIABILITY FIX (2026-08-06): ported three fixes proven in production on
+Marius's video_generation.py, none of which this file had yet:
+1. RETRY-SAFE submit: submit_agnes_task now retries transient backend
+   errors (429 rate limit, 500/502/503/504 server-side) with backoff
+   before giving up, instead of letting a single flaky response burn one
+   of only 3 total per-shot retries. This matters more here than in
+   Marius specifically because Agnes's documented 1 req/min ceiling for
+   this account means a 429 is an expected, routine event, not a rare
+   edge case - it should never cost real retry budget.
+2. POLL TIMEOUT: raised from 240s (4 min) to 900s (15 min).
+   Marius's own production logs show real Agnes generations taking
+   14-38 minutes under free-tier load; a 4-minute poll timeout was very
+   likely aborting shots that were still legitimately rendering, forcing
+   a full resubmission (and burning another shot_retry_count tick) for
+   work that would have finished on its own.
+3. CONTENT-POLICY-AWARE: submit_agnes_task now raises a distinct
+   ContentPolicyRejection instead of a generic RuntimeError, and main()
+   marks that row permanently 'failed' immediately (not after 3 retries)
+   with the offending prompt logged - a content-policy rejection will
+   never succeed on retry, so spending the per-shot retry budget on it
+   only delays finding out.
+4. CLIP VERIFICATION ON RESUME: before rendering the next shot, HEAD
+   -checks every already-recorded video_urls entry once. A clip whose
+   URL has gone stale/expired is silently dropped and re-rendered,
+   instead of being built into the final assembly as a broken link -
+   same fix Marius already has.
+
 New Supabase column added for this: shot_retry_count (integer, default 0)
 on video_pipeline - tracks retries for the CURRENT shot only, separate
 from any whole-video retry_count used elsewhere.
@@ -50,11 +77,28 @@ AGNES_HEADERS = {
 
 WIDTH, HEIGHT = 1280, 720
 FRAME_RATE = 24
-POLL_MAX_WAIT = 240
+
+# RELIABILITY FIX (2026-08-06): 240s (4 min) was frequently shorter than
+# real Agnes render time under free-tier load (confirmed 14-38 min in
+# Marius's production logs), causing shots to be abandoned mid-render.
+POLL_MAX_WAIT = 900
 POLL_INTERVAL = 10
+
+# RELIABILITY FIX (2026-08-06): ported from Marius - retry transient
+# backend errors instead of burning per-shot retry budget on them. Agnes's
+# documented 1 req/min ceiling for this account means a 429 here is
+# routine, not exceptional.
+AGNES_RETRYABLE_CODES = {429, 500, 502, 503, 504}
+AGNES_MAX_RETRIES = 4
 
 VIDEO_CLIPS_BUCKET = "video_clips"
 RETRY_LIMIT = 3  # per-SHOT retries now, not per-video
+
+CLIP_VERIFY_TIMEOUT = 15
+
+
+class ContentPolicyRejection(Exception):
+    pass
 
 
 def _supabase_request(method, path, body=None):
@@ -90,6 +134,12 @@ def frames_for_duration(duration_seconds, frame_rate=FRAME_RATE):
 
 
 def submit_agnes_task(prompt, duration_seconds):
+    """RELIABILITY FIX (2026-08-06): retries 429/5xx with backoff instead
+    of surfacing the first transient error straight to main(), where it
+    would burn one of only RETRY_LIMIT=3 total per-shot attempts on
+    something that had nothing to do with the prompt itself. A genuine
+    content-policy rejection (400) is raised immediately as
+    ContentPolicyRejection since retrying that can never succeed."""
     body = json.dumps({
         "model": AGNES_MODEL,
         "prompt": prompt,
@@ -98,17 +148,32 @@ def submit_agnes_task(prompt, duration_seconds):
         "num_frames": frames_for_duration(duration_seconds),
         "frame_rate": FRAME_RATE,
     }).encode()
-    req = urllib.request.Request(AGNES_SUBMIT_URL, data=body, method="POST", headers=AGNES_HEADERS)
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode(errors="replace")[:500]
-        raise RuntimeError(f"Agnes submit HTTP {e.code}: {error_body}") from e
-    video_id = data.get("video_id") or data.get("id")
-    if not video_id:
-        raise RuntimeError(f"Agnes submit response had no video_id: {data}")
-    return video_id
+
+    last_error_text = None
+    for attempt in range(AGNES_MAX_RETRIES):
+        req = urllib.request.Request(AGNES_SUBMIT_URL, data=body, method="POST", headers=AGNES_HEADERS)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode(errors="replace")[:500]
+            if e.code == 400 and "content_policy_violation" in error_body:
+                raise ContentPolicyRejection(error_body)
+            if e.code in AGNES_RETRYABLE_CODES:
+                last_error_text = f"HTTP {e.code}: {error_body}"
+                wait = 20 * (attempt + 1)
+                print(f"Agnes submit transient error {e.code} (attempt {attempt + 1}/{AGNES_MAX_RETRIES}): {error_body}")
+                print(f"Retrying in {wait}s...")
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"Agnes submit HTTP {e.code}: {error_body}") from e
+
+        video_id = data.get("video_id") or data.get("id")
+        if not video_id:
+            raise RuntimeError(f"Agnes submit response had no video_id: {data}")
+        return video_id
+
+    raise RuntimeError(f"Agnes submit still failing after {AGNES_MAX_RETRIES} attempts: {last_error_text}")
 
 
 def poll_agnes_task(video_id):
@@ -121,6 +186,13 @@ def poll_agnes_task(video_id):
                 data = json.loads(resp.read())
         except urllib.error.HTTPError as e:
             error_body = e.read().decode(errors="replace")[:500]
+            if e.code == 400 and "content_policy_violation" in error_body:
+                raise ContentPolicyRejection(error_body)
+            if e.code in AGNES_RETRYABLE_CODES:
+                print(f"Agnes poll transient error {e.code}, will retry within the same poll loop: {error_body}")
+                time.sleep(POLL_INTERVAL)
+                waited += POLL_INTERVAL
+                continue
             raise RuntimeError(f"Agnes poll HTTP {e.code}: {error_body}") from e
         status = data.get("status")
         if status == "completed":
@@ -139,6 +211,20 @@ def poll_agnes_task(video_id):
 def download_file(url, out_path):
     urllib.request.urlretrieve(url, out_path)
     return out_path
+
+
+def verify_clip_url(url):
+    """RELIABILITY FIX (2026-08-06): ported from Marius - HEAD-check an
+    already-recorded clip URL before trusting it. A stale/expired storage
+    URL silently built into the final assembly produces a broken video;
+    catching it here means we just re-render that one shot instead."""
+    req = urllib.request.Request(url, method="HEAD")
+    try:
+        with urllib.request.urlopen(req, timeout=CLIP_VERIFY_TIMEOUT) as resp:
+            return resp.status == 200
+    except Exception as e:
+        print(f"Clip verification failed for {url}: {e}")
+        return False
 
 
 def upload_clip(row_id, index, local_path):
@@ -212,6 +298,22 @@ def main():
         )
         return
 
+    # RELIABILITY FIX (2026-08-06): verify already-recorded clips before
+    # trusting them, same as Marius. Drops any stale URL and lets it
+    # re-render instead of silently shipping a broken link in assembly.
+    if video_urls:
+        verified_urls = []
+        for i, url in enumerate(video_urls):
+            if verify_clip_url(url):
+                verified_urls.append(url)
+            else:
+                print(f"Row {row_id}: clip {i} failed verification, will regenerate from here.")
+                break
+        if len(verified_urls) != len(video_urls):
+            video_urls = verified_urls
+            save_progress(row_id, video_urls, 0)
+            print(f"Row {row_id}: corrected progress after verification - {len(video_urls)}/{len(shot_list)} shots actually confirmed done")
+
     next_index = len(video_urls)
     total_shots = len(shot_list)
 
@@ -242,6 +344,15 @@ def main():
             save_progress(row_id, video_urls, 0)  # reset per-shot retry counter on success
             print(f"Row {row_id}: shot {next_index + 1}/{total_shots} done. "
                   f"{total_shots - len(video_urls)} remaining, will continue next run.")
+    except ContentPolicyRejection as e:
+        # RELIABILITY FIX (2026-08-06): a content-policy rejection will
+        # never succeed on retry - fail the row immediately instead of
+        # spending RETRY_LIMIT attempts finding that out the slow way.
+        mark_row_permanently_failed(
+            row_id,
+            f"shot {next_index + 1}/{total_shots} rejected on content-policy grounds: {e}. "
+            f"Prompt was: {prompt!r}. Reword shot_list[{next_index}] and reset status to 'narrated' to resume.",
+        )
     except Exception as e:
         next_retry = shot_retry_count + 1
         if next_retry >= RETRY_LIMIT:
