@@ -32,6 +32,16 @@ Chatterbox's defaults. Also fixes two known issues:
   - Atempo artifact: the slowdown pass now upsamples to 48kHz before
     atempo and back down after, instead of applying atempo directly at
     24kHz, which was producing a warble/artifact on the slowed audio.
+
+TEMPO FIX (2026-08-06): the previous TEMPO_FACTOR of 0.92 (8% SLOWER than
+raw TTS output) was Zia's confirmed judgment based on actually listening
+to a real generated test-row narration - too slow. Changed to 1.25 (25%
+FASTER than raw output) per his direct feedback comparing both speeds on
+the same real audio. Renamed from SLOWDOWN_FACTOR to TEMPO_FACTOR since
+it's no longer a slowdown - the duration-scaling math below already works
+correctly in either direction (a factor >1 correctly shortens
+scaled_shot_durations, a factor <1 correctly lengthens them), so no other
+logic needed to change.
 """
 import os
 import re
@@ -54,7 +64,7 @@ HEADERS = {
 
 NARRATION_BUCKET = "narration"
 
-SLOWDOWN_FACTOR = "0.92"  # 8% slower, pitch preserved - matches TDP's existing pacing choice
+TEMPO_FACTOR = "1.25"  # 25% faster, pitch preserved - Zia confirmed via real test-row output that the previous 0.92 (8% slower) pacing sounded too slow, and 1.25x sounds better
 
 PAUSE_SECONDS_MIN = 1.0
 PAUSE_SECONDS_MAX = 2.0
@@ -283,7 +293,7 @@ def main():
     subprocess.run(
         [
             "ffmpeg", "-y", "-i", raw_filename,
-            "-filter:a", f"aresample=48000,atempo={SLOWDOWN_FACTOR},aresample=24000",
+            "-filter:a", f"aresample=48000,atempo={TEMPO_FACTOR},aresample=24000",
             output_filename,
         ],
         check=True, capture_output=True,
@@ -294,7 +304,7 @@ def main():
     narration_url = upload_narration(row_id, output_filename)
     print(f"Uploaded. Public URL: {narration_url}")
 
-    slowdown = float(SLOWDOWN_FACTOR)
+    slowdown = float(TEMPO_FACTOR)
     scaled_shot_durations = [d / slowdown for d in shot_durations]
 
     save_progress(row_id, narration_url, scaled_shot_durations)
