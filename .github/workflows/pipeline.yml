@@ -1,8 +1,11 @@
 name: TechPulse Pipeline
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
+concurrency:
+  group: techpulse-pipeline
+  cancel-in-progress: false
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
