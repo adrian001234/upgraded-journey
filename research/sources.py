@@ -15,6 +15,16 @@ narration - which the TTS stage then read aloud word-for-word, producing
 a video where the narrator reads Python syntax mid-story. Now every
 summary is HTML-stripped, code-block-stripped, and length-capped before
 it's saved, so nothing but plain prose ever reaches the script stage.
+
+FIXED (2026-08-06): duplicate-check bypass. The dedup check only ran
+inside `if link and _link_already_processed(link)` - if an RSS entry's
+link ever came back empty (some feeds omit it, or feedparser returns ""
+on a malformed entry), the whole check was skipped and that headline was
+free to be picked again on a future run with zero protection, producing
+a repeat video with a different id. Now every candidate is checked -
+by link when one exists, falling back to an exact title match against
+already-processed rows when it doesn't - so an empty link can no longer
+silently disable dedup.
 """
 import feedparser
 import json
@@ -69,13 +79,12 @@ def _parse_date(entry):
         return datetime.min.replace(tzinfo=timezone.utc)
 
 
-def _link_already_processed(link):
-    """Check the Supabase video_pipeline table for an existing row with this link."""
+def _query_supabase_exists(filter_clause):
+    """Runs a single exists-check query against video_pipeline. filter_clause is
+    a raw PostgREST filter string, e.g. 'link=eq.foo' or 'title=eq.bar'."""
     if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-        print("Warning: SUPABASE_URL/SUPABASE_ANON_KEY not set in this stage — skipping duplicate check.")
         return False
-    encoded_link = urllib.parse.quote(link, safe="")
-    url = f"{SUPABASE_URL}/rest/v1/video_pipeline?link=eq.{encoded_link}&select=id"
+    url = f"{SUPABASE_URL}/rest/v1/video_pipeline?{filter_clause}&select=id"
     req = urllib.request.Request(
         url,
         headers={
@@ -88,8 +97,26 @@ def _link_already_processed(link):
             rows = json.loads(resp.read())
             return len(rows) > 0
     except Exception as e:
-        print(f"Warning: could not reach Supabase to check duplicates ({e}). Proceeding without dedup check for this run.")
+        print(f"Warning: could not reach Supabase for a dedup check ({e}). Proceeding without it for this check.")
         return False
+
+
+def _headline_already_processed(link, title):
+    """Check whether this headline has already been processed. Prefers an
+    exact link match; if link is missing/empty, falls back to an exact title
+    match so a blank link can never silently bypass dedup entirely."""
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+        print("Warning: SUPABASE_URL/SUPABASE_ANON_KEY not set in this stage - skipping duplicate check.")
+        return False
+    if link:
+        encoded_link = urllib.parse.quote(link, safe="")
+        if _query_supabase_exists(f"link=eq.{encoded_link}"):
+            return True
+    if title:
+        encoded_title = urllib.parse.quote(title, safe="")
+        if _query_supabase_exists(f"title=eq.{encoded_title}"):
+            return True
+    return False
 
 
 def fetch_headlines(limit_per_source=5):
@@ -117,8 +144,9 @@ def select_top_headline(headlines):
     ranked = sorted(headlines, key=lambda h: h["_sort_date"], reverse=True)
     for candidate in ranked:
         link = candidate.get("link", "")
-        if link and _link_already_processed(link):
-            print(f"Skipping already-processed headline: {candidate['title']}")
+        title = candidate.get("title", "")
+        if _headline_already_processed(link, title):
+            print(f"Skipping already-processed headline: {title}")
             continue
         candidate.pop("_sort_date", None)
         return [candidate]
