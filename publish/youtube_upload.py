@@ -21,6 +21,16 @@ retry. Now failures leave the row's status untouched (it's already
 query naturally picks it up again) and just increment retry_count, up
 to RETRY_LIMIT times, before finally marking it permanently failed so a
 human notices.
+
+FIXED (2026-08-05): YouTube rejects any video title over 100 characters
+with "invalid or empty video title" - a confusing error for what's
+actually a length problem, not an empty-string problem. The headline
+"Google nixes its Earth AI feature one day after launch, amid criticism
+it would spread misinformation" is 101 characters and hit exactly this.
+Titles are now truncated to 100 characters at the last whole word before
+being sent to YouTube - the full original headline is unaffected anywhere
+else (Supabase title column, narration, etc.), only what's sent to the
+YouTube API is shortened.
 """
 import os
 from datetime import datetime, timezone
@@ -46,6 +56,7 @@ HEADERS = {
 TMP_DIR = "publish/tmp"
 
 RETRY_LIMIT = 3
+YOUTUBE_TITLE_MAX_CHARS = 100
 
 
 def get_next_video_generated_row():
@@ -95,10 +106,22 @@ def get_youtube_client():
     return build("youtube", "v3", credentials=creds)
 
 
+def build_youtube_title(title):
+    """YouTube hard-rejects titles over 100 chars. Truncate at the last
+    whole word within the limit rather than cutting mid-word."""
+    if len(title) <= YOUTUBE_TITLE_MAX_CHARS:
+        return title
+    truncated = title[:YOUTUBE_TITLE_MAX_CHARS]
+    last_space = truncated.rfind(" ")
+    if last_space > 0:
+        truncated = truncated[:last_space]
+    return truncated.rstrip(" ,.-") 
+
+
 def upload_to_youtube(youtube, title, description, local_path):
     body = {
         "snippet": {
-            "title": title,
+            "title": build_youtube_title(title),
             "description": (description or "")[:4900],
             "categoryId": "28",
         },
