@@ -19,7 +19,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
         run: |
-          python3 - <<'EOF'
+          python3 - <<'PYEOF'
           import os, json, urllib.request, sys
 
           url = os.environ.get("SUPABASE_URL", "")
@@ -49,7 +49,7 @@ jobs:
           print(f"Story already in progress: {in_progress}")
           with open(gh_output, "a") as f:
               f.write(f"start_new_story={'false' if in_progress else 'true'}\n")
-          EOF
+          PYEOF
       - name: Install dependencies
         run: pip install feedparser requests pydub google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2 chatterbox-tts
       - name: Install ffmpeg
@@ -71,6 +71,7 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          CHATTERBOX_VOICE_REF_URL: ${{ vars.CHATTERBOX_VOICE_REF_URL }}
         run: python narration/generate_narration.py
       - name: Video stage
         env:
