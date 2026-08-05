@@ -52,6 +52,24 @@ read/write showing on the connector — a known Anthropic-side bug, not a permis
 issue on this repo. Periodically retest it (try a trivial write); if it's been fixed,
 drop the copy-paste workaround.
 
+## 11. Read Every Pipeline-Adjacent File Before Changing Any One of Them
+This pipeline is a chain: research -> script -> narration -> video -> assembly -> publish.
+Each stage's code makes assumptions about the exact column names, status values, and JSON
+shapes the stage before and after it uses. Before editing ANY one stage, pull the CURRENT
+live content of the stage immediately before it and immediately after it (not from memory
+of a prior session, not from what a previous chat summary says — the actual file, right
+now) and confirm the status values / field names / data shapes still line up end to end.
+Do the same Supabase schema check (actual live columns on video_pipeline, not an assumed
+schema) before writing any code that reads or writes a new column.
+This is not optional even for a "small" one-file fix — a change that looks correct in
+isolation can silently break the handoff to the next stage if that stage was changed by a
+different session since you last saw it. This exact failure happened on 2026-08-04/05: one
+session introduced a separate `video_shots` table + `shots_pending` status while another
+session, working from the already-established `shot_list`/`scripted`/`narrated` schema,
+had no idea the first session's design existed — the two were incompatible until a later
+session caught it by re-reading every file's live content instead of trusting either prior
+session's notes.
+
 ## Known past incidents (do not repeat)
 - Backup restore crashed on HTTP 400 from Supabase Storage (only 404 was handled). Fixed
   in db-backup.ts — readTarget() now treats 400 as "no backup found."
@@ -62,6 +80,13 @@ drop the copy-paste workaround.
   account was selected during OAuth. A working upload to the *wrong* channel (e.g.
   Erased instead of TechPulse Daily) looks like success in logs — always confirm which
   channel a token is authorized for, not just that it works.
+- 2026-08-04/05: switching from 30-40s Shorts to long-form video, one session invented a
+  `video_shots` table + `shots_pending` status for generate_script.py/generate_video.py
+  without first reading narration/generate_narration.py or pipeline.yml's gate query, both
+  of which already assumed a different, already-established schema (`shot_list` JSON on
+  the pipeline row, `scripted`/`narrated`/`video_complete` statuses, ported from Marius).
+  Result: two incompatible designs committed to main until a later session caught the
+  mismatch by re-reading every adjacent file's live content (see Rule 11).
 
 ## Access notes
 - GitHub write access via the Claude.ai connector is unreliable (403) even when the
@@ -79,5 +104,3 @@ drop the copy-paste workaround.
 - not a lesson in how the code works.
 - Every path, URL, or anything to be copied must be given in a copy-paste code block,
   no exceptions.
-
-
