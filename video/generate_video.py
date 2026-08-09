@@ -56,6 +56,24 @@ Marius's video_generation.py, none of which this file had yet:
 New Supabase column added for this: shot_retry_count (integer, default 0)
 on video_pipeline - tracks retries for the CURRENT shot only, separate
 from any whole-video retry_count used elsewhere.
+
+MULTI-SHOT-PER-RUN FIX (2026-08-09): confirmed via live Actions log that
+this was rendering exactly 1 shot per 5-minute cron tick, so a 63-shot
+long-form video took ~5 hours of real time even though Agnes itself was
+responding promptly - almost all of that time was the job spinning up,
+doing one shot, and exiting, then sitting idle until the next cron tick.
+main() now loops rendering shots within a SINGLE run instead of exiting
+after one, pacing submissions AGNES_MIN_SECONDS_BETWEEN_SUBMITS (65s -
+just over Agnes's documented 1 req/min cap for this account, matching
+the existing rate limit exactly rather than batching shots the way
+Marius does, which would 429-storm this account) apart. A run stops
+looping when: the video (or all currently-ready videos) reaches
+video_complete, MAX_SHOTS_PER_RUN is hit, or elapsed time approaches
+RUN_TIME_BUDGET_SECONDS (leaving headroom under the job's 300-minute
+timeout so a run always exits cleanly rather than getting killed
+mid-shot). This does not change per-shot logic, retry behavior, or the
+resumable one-shot-of-progress-per-save pattern at all - only wraps it
+in a loop instead of running it once per process invocation.
 """
 import json
 import os
@@ -95,6 +113,18 @@ VIDEO_CLIPS_BUCKET = "video_clips"
 RETRY_LIMIT = 3  # per-SHOT retries now, not per-video
 
 CLIP_VERIFY_TIMEOUT = 15
+
+# MULTI-SHOT-PER-RUN FIX (2026-08-09): see file header. 65s keeps every
+# Agnes submission just over 1 per minute, matching this account's
+# documented cap - intentionally NOT batching multiple shots close
+# together the way Marius does, since Marius's account has no such cap.
+AGNES_MIN_SECONDS_BETWEEN_SUBMITS = 65
+MAX_SHOTS_PER_RUN = 30
+# Job timeout is 300 minutes; stop starting new shots once we're within
+# this many seconds of that, so a run always exits cleanly (progress
+# already saved after every shot) instead of getting hard-killed by
+# GitHub mid-render.
+RUN_TIME_BUDGET_SECONDS = 260 * 60
 
 
 class ContentPolicyRejection(Exception):
@@ -270,11 +300,16 @@ def mark_row_permanently_failed(row_id, reason):
     _supabase_request("PATCH", f"video_pipeline?id=eq.{row_id}", {"status": "failed"})
 
 
-def main():
+def render_one_shot():
+    """Renders exactly the next not-yet-done shot on the oldest 'narrated'
+    row. Returns True if a shot was successfully rendered (progress was
+    made, whether or not that shot completed the video), False if there
+    was nothing to do (no ready row) or the row hit a stopping condition
+    (content-policy fail, permanent fail, or already fully done)."""
     row = get_next_row_to_render()
     if not row:
         print("No 'narrated' rows found. Nothing to do.")
-        return
+        return False
 
     row_id = row["id"]
     shot_list = row.get("shot_list")
@@ -290,17 +325,14 @@ def main():
 
     if not shot_list:
         mark_row_permanently_failed(row_id, "no shot_list on a 'narrated' row")
-        return
+        return False
     if not shot_durations or len(shot_durations) != len(shot_list):
         mark_row_permanently_failed(
             row_id,
             f"shot_durations missing or length mismatch ({len(shot_durations or [])} vs {len(shot_list)} shots)",
         )
-        return
+        return False
 
-    # RELIABILITY FIX (2026-08-06): verify already-recorded clips before
-    # trusting them, same as Marius. Drops any stale URL and lets it
-    # re-render instead of silently shipping a broken link in assembly.
     if video_urls:
         verified_urls = []
         for i, url in enumerate(video_urls):
@@ -320,7 +352,7 @@ def main():
     if next_index >= total_shots:
         print(f"Row {row_id}: all {total_shots} shots already done, finalizing.")
         mark_video_complete(row_id, video_urls)
-        return
+        return False
 
     shot = shot_list[next_index]
     prompt = shot.get("scene_description") or shot.get("visual_description", "")
@@ -341,26 +373,57 @@ def main():
             mark_video_complete(row_id, video_urls)
             print(f"Row {row_id}: all {total_shots} shots done this run. Status -> video_complete.")
         else:
-            save_progress(row_id, video_urls, 0)  # reset per-shot retry counter on success
+            save_progress(row_id, video_urls, 0)
             print(f"Row {row_id}: shot {next_index + 1}/{total_shots} done. "
-                  f"{total_shots - len(video_urls)} remaining, will continue next run.")
+                  f"{total_shots - len(video_urls)} remaining, will continue this run if time/budget allow.")
+        return True
     except ContentPolicyRejection as e:
-        # RELIABILITY FIX (2026-08-06): a content-policy rejection will
-        # never succeed on retry - fail the row immediately instead of
-        # spending RETRY_LIMIT attempts finding that out the slow way.
         mark_row_permanently_failed(
             row_id,
             f"shot {next_index + 1}/{total_shots} rejected on content-policy grounds: {e}. "
             f"Prompt was: {prompt!r}. Reword shot_list[{next_index}] and reset status to 'narrated' to resume.",
         )
+        return False
     except Exception as e:
         next_retry = shot_retry_count + 1
         if next_retry >= RETRY_LIMIT:
             mark_row_permanently_failed(row_id, f"shot {next_index + 1}/{total_shots} failed {RETRY_LIMIT}x: {e}")
+            return False
         else:
             print(f"Row {row_id}: shot {next_index + 1}/{total_shots} failed "
                   f"(attempt {next_retry}/{RETRY_LIMIT}): {e}. Will retry next run.")
             save_progress(row_id, video_urls, next_retry)
+            return True
+
+
+def main():
+    run_start = time.monotonic()
+    shots_this_run = 0
+
+    while shots_this_run < MAX_SHOTS_PER_RUN:
+        elapsed = time.monotonic() - run_start
+        if elapsed >= RUN_TIME_BUDGET_SECONDS:
+            print(f"Run time budget ({RUN_TIME_BUDGET_SECONDS}s) reached after {shots_this_run} shot(s) - "
+                  f"stopping cleanly, next scheduled run continues.")
+            break
+
+        shot_start = time.monotonic()
+        made_progress = render_one_shot()
+        if not made_progress:
+            break
+        shots_this_run += 1
+
+        time_spent_on_shot = time.monotonic() - shot_start
+        remaining_pace = AGNES_MIN_SECONDS_BETWEEN_SUBMITS - time_spent_on_shot
+        if remaining_pace > 0 and shots_this_run < MAX_SHOTS_PER_RUN:
+            elapsed = time.monotonic() - run_start
+            if elapsed + remaining_pace >= RUN_TIME_BUDGET_SECONDS:
+                print(f"Pacing sleep would exceed the run time budget - stopping after {shots_this_run} shot(s) instead.")
+                break
+            print(f"Pacing {remaining_pace:.0f}s before next Agnes submission (staying under 1 req/min)...")
+            time.sleep(remaining_pace)
+
+    print(f"Run finished: {shots_this_run} shot(s) rendered this run.")
 
 
 if __name__ == "__main__":
