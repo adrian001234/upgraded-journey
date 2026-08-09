@@ -20,9 +20,23 @@ per-shot audio timing) and a visual_description (the actual Agnes video
 prompt). The two are asked for together so the excerpts, concatenated in
 order, reconstruct the full narration - required for narration.py's
 sentence/word-overlap timing algorithm to line up correctly.
+
+RETRY FIX (2026-08-09): call_gemini() previously made exactly one attempt -
+any transient 429/5xx/network hiccup silently killed that headline's only
+script slot for the whole 5-minute pipeline cycle, with no record of why.
+Ported the same retry-with-backoff pattern already proven in Marius's
+script_writing.py: up to 4 attempts, 15/30/45s backoff, retryable on
+429/500/502/503/504 and on network errors. Unlike Marius, there is no
+persistent topic-tracking table here (headlines come fresh from
+research/latest_headlines.json each run and generate_scripts() already
+moves on to the next headline on failure), so no blacklist-status logic
+was ported - it would have nothing to attach to. Failure reasons are now
+printed with the same detail Marius logs, so they show up in the Action
+run output.
 """
 import json
 import os
+import time
 import urllib.request
 import urllib.error
 
@@ -39,6 +53,9 @@ HEADERS = {
 
 TARGET_WORD_COUNT = "900-1100"   # ~6-7 minutes spoken
 TARGET_SHOT_COUNT = 45           # roughly one shot per 8-9 seconds of narration
+
+MAX_RETRIES = 4
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 PROMPT_TEMPLATE = """You are writing a long-form YouTube video (6-7 minutes) for a tech/AI/science news channel. Your job is to hold attention for the full length with a documentary-style narrative, not a quick hook-and-CTA format.
 Headline: {title}
@@ -73,35 +90,70 @@ def call_gemini(prompt):
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"response_mime_type": "application/json"}
     }).encode()
-    req = urllib.request.Request(
-        GEMINI_URL,
-        data=body,
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            status = resp.status
-            raw_bytes = resp.read()
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode(errors="replace")[:500]
-        raise RuntimeError(f"HTTP {e.code} from Gemini. Body: {error_body}") from e
-    if not raw_bytes.strip():
-        raise RuntimeError(f"Gemini returned an EMPTY body. Status={status}")
-    try:
-        result = json.loads(raw_bytes)
-    except json.JSONDecodeError as e:
-        preview = raw_bytes[:500].decode(errors="replace")
-        raise RuntimeError(f"Gemini response wasn't valid JSON. Status={status}. Body preview: {preview}") from e
-    try:
-        content = result["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError, TypeError) as e:
-        raise RuntimeError(f"Unexpected response shape from Gemini: {json.dumps(result)[:500]}") from e
-    if not content or not content.strip():
-        raise RuntimeError("Gemini returned an empty completion.")
-    print("=== RAW GEMINI OUTPUT (truncated to 1000 chars) ===")
-    print(content.strip()[:1000])
-    print("=== END ===")
-    return content.strip()
+
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        req = urllib.request.Request(
+            GEMINI_URL,
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                status = resp.status
+                raw_bytes = resp.read()
+        except urllib.error.HTTPError as e:
+            if e.code in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES - 1:
+                wait = (attempt + 1) * 15
+                error_body = e.read().decode(errors="replace")[:300]
+                print(f"Gemini HTTP {e.code} (retryable), waiting {wait}s before retry {attempt + 2}/{MAX_RETRIES}: {error_body}")
+                last_error = f"HTTP {e.code}: {error_body}"
+                time.sleep(wait)
+                continue
+            error_body = e.read().decode(errors="replace")[:500]
+            raise RuntimeError(f"HTTP {e.code} from Gemini after {attempt + 1} attempt(s). Body: {error_body}") from e
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            if attempt < MAX_RETRIES - 1:
+                wait = (attempt + 1) * 15
+                print(f"Gemini network error ({e.__class__.__name__}: {e}), waiting {wait}s before retry {attempt + 2}/{MAX_RETRIES}...")
+                last_error = f"{e.__class__.__name__}: {e}"
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"Gemini network error after {attempt + 1} attempt(s): {e}") from e
+
+        if not raw_bytes.strip():
+            if attempt < MAX_RETRIES - 1:
+                wait = (attempt + 1) * 15
+                print(f"Gemini returned an EMPTY body (status={status}), waiting {wait}s before retry {attempt + 2}/{MAX_RETRIES}...")
+                last_error = f"empty body, status={status}"
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"Gemini returned an EMPTY body after {attempt + 1} attempt(s). Status={status}")
+
+        try:
+            result = json.loads(raw_bytes)
+        except json.JSONDecodeError as e:
+            preview = raw_bytes[:500].decode(errors="replace")
+            raise RuntimeError(f"Gemini response wasn't valid JSON. Status={status}. Body preview: {preview}") from e
+        try:
+            content = result["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError, TypeError) as e:
+            raise RuntimeError(f"Unexpected response shape from Gemini: {json.dumps(result)[:500]}") from e
+        if not content or not content.strip():
+            if attempt < MAX_RETRIES - 1:
+                wait = (attempt + 1) * 15
+                print(f"Gemini returned an empty completion, waiting {wait}s before retry {attempt + 2}/{MAX_RETRIES}...")
+                last_error = "empty completion"
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"Gemini returned an empty completion after {attempt + 1} attempt(s).")
+
+        print("=== RAW GEMINI OUTPUT (truncated to 1000 chars) ===")
+        print(content.strip()[:1000])
+        print("=== END ===")
+        return content.strip()
+
+    raise RuntimeError(f"Gemini still failing after {MAX_RETRIES} attempts. Last error: {last_error}")
 
 
 def _supabase_request(method, path, body=None):
