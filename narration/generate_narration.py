@@ -42,6 +42,18 @@ it's no longer a slowdown - the duration-scaling math below already works
 correctly in either direction (a factor >1 correctly shortens
 scaled_shot_durations, a factor <1 correctly lengthens them), so no other
 logic needed to change.
+
+STUTTER-PICK FIX (2026-08-29): synthesize_sentence already detected when
+Chatterbox produced an anomalously long clip (a known Chatterbox failure
+mode - repeating/duplicating part of the sentence, heard by Zia as the
+narrator "breaking the sentence in half" / stuttering) and retried up to
+MAX_SENTENCE_TTS_ATTEMPTS times - but if EVERY retry still came back
+anomalous, it silently used the LAST attempt regardless of whether it was
+the worst of the three, not the best. Now every attempt's clip+duration is
+kept, and if none pass the plausibility check, the attempt with the
+SHORTEST duration is used (a duplicated/repeated sentence is always
+longer than a clean one, so shortest = least-stuttered of the batch) -
+this can only improve or match the old behavior, never make it worse.
 """
 import os
 import re
@@ -131,8 +143,7 @@ def _max_plausible_duration(text):
 
 def synthesize_sentence(text, tts, tmp_path, voice_ref_path):
     max_plausible = _max_plausible_duration(text)
-    last_duration = None
-    clip = None
+    attempts = []  # (duration_seconds, clip) for every attempt, best-of fallback if none pass
 
     for attempt in range(MAX_SENTENCE_TTS_ATTEMPTS):
         wav = tts.generate(
@@ -144,7 +155,7 @@ def synthesize_sentence(text, tts, tmp_path, voice_ref_path):
         torchaudio.save(tmp_path, wav, tts.sr)
         clip = AudioSegment.from_file(tmp_path)
         duration_seconds = len(clip) / 1000.0
-        last_duration = duration_seconds
+        attempts.append((duration_seconds, clip))
 
         if duration_seconds <= max_plausible:
             return clip.fade_in(STITCH_FADE_MS).fade_out(STITCH_FADE_MS)
@@ -154,10 +165,15 @@ def synthesize_sentence(text, tts, tmp_path, voice_ref_path):
               f"{len(text.split())} words) - attempt {attempt + 1}/{MAX_SENTENCE_TTS_ATTEMPTS}. "
               f"Sentence: {text[:80]!r}")
 
-    print(f"Sentence still looks anomalous after {MAX_SENTENCE_TTS_ATTEMPTS} attempts "
-          f"({last_duration:.1f}s) - using the last attempt anyway rather than blocking the whole run: "
-          f"{text[:80]!r}")
-    return clip.fade_in(STITCH_FADE_MS).fade_out(STITCH_FADE_MS)
+    # STUTTER-PICK FIX (2026-08-29): every attempt came back anomalous -
+    # previously this used the LAST attempt regardless of quality. A
+    # duplicated/repeated sentence is always LONGER than a clean read, so
+    # the shortest of the batch is the least-stuttered option available.
+    best_duration, best_clip = min(attempts, key=lambda a: a[0])
+    print(f"Sentence still looks anomalous after {MAX_SENTENCE_TTS_ATTEMPTS} attempts - "
+          f"using the SHORTEST of the {len(attempts)} attempts ({best_duration:.1f}s) as the "
+          f"least-stuttered option, rather than blocking the whole run: {text[:80]!r}")
+    return best_clip.fade_in(STITCH_FADE_MS).fade_out(STITCH_FADE_MS)
 
 
 def _assign_shots_to_sentences(sentences, shot_list):
