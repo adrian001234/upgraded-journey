@@ -45,15 +45,27 @@ logic needed to change.
 
 STUTTER-PICK FIX (2026-08-29): synthesize_sentence already detected when
 Chatterbox produced an anomalously long clip (a known Chatterbox failure
-mode - repeating/duplicating part of the sentence, heard by Zia as the
-narrator "breaking the sentence in half" / stuttering) and retried up to
+mode - repeating/duplicating part of the sentence) and retried up to
 MAX_SENTENCE_TTS_ATTEMPTS times - but if EVERY retry still came back
 anomalous, it silently used the LAST attempt regardless of whether it was
 the worst of the three, not the best. Now every attempt's clip+duration is
 kept, and if none pass the plausibility check, the attempt with the
 SHORTEST duration is used (a duplicated/repeated sentence is always
-longer than a clean one, so shortest = least-stuttered of the batch) -
-this can only improve or match the old behavior, never make it worse.
+longer than a clean one, so shortest = least-stuttered of the batch).
+
+ABBREVIATION-SPLIT FIX (2026-08-29): split_into_segments below split on
+ANY ".", "!", or "?" followed by whitespace - which wrongly treats
+abbreviations and initials as full sentence ends. "Dr. Smith explained"
+was being split into "Dr." and "Smith explained" as if they were two
+separate sentences, each getting its own TTS call AND the full 1-2s
+inter-sentence pause inserted between them - audible as the narrator
+stopping mid-sentence before continuing (Zia's report: narration "does
+not complete a sentence in one go"). This is the real, verified cause of
+that symptom - not a TTS glitch. A short list of common abbreviations/
+titles/initials now guards against this: if the word right before the
+period matches one of these (or is a single letter, i.e. an initial),
+the split is skipped and the sentence keeps building instead of being
+cut there.
 """
 import os
 import re
@@ -100,6 +112,14 @@ CFG_WEIGHT = 0.4
 
 _tts_model = None
 
+# ABBREVIATION-SPLIT FIX (2026-08-29): see file header.
+_ABBREVIATIONS = {
+    "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "no", "vs",
+    "etc", "eg", "ie", "approx", "inc", "ltd", "corp", "co", "u.s",
+    "u.k", "u.n", "u.s.a", "a.m", "p.m", "ph.d", "gov", "sen", "rep",
+    "capt", "gen", "lt", "col", "maj", "ave", "blvd", "dept",
+}
+
 
 def get_tts_model():
     global _tts_model
@@ -131,9 +151,25 @@ def get_next_scripted_row():
 
 
 def split_into_segments(narration_text):
-    raw_segments = re.split(r"(?<=[.!?])\s+", narration_text.strip())
-    segments = [seg.strip() for seg in raw_segments if seg.strip()]
-    return segments if segments else [narration_text.strip()]
+    """Splits narration into one segment per real SENTENCE, so a pause gets
+    inserted only at genuine sentence boundaries - not after abbreviations,
+    titles, or initials that happen to end in a period. See
+    ABBREVIATION-SPLIT FIX in the file header."""
+    raw_pieces = re.split(r"(?<=[.!?])\s+", narration_text.strip())
+    segments = []
+    buffer = ""
+    for piece in raw_pieces:
+        buffer = f"{buffer} {piece}".strip() if buffer else piece
+        match = re.search(r"([A-Za-z]+)\.$", buffer)
+        if match:
+            word = match.group(1).lower()
+            if word in _ABBREVIATIONS or len(word) <= 2:
+                continue  # not a real sentence end - keep accumulating
+        segments.append(buffer.strip())
+        buffer = ""
+    if buffer.strip():
+        segments.append(buffer.strip())
+    return [s for s in segments if s] or [narration_text.strip()]
 
 
 def _max_plausible_duration(text):
@@ -165,10 +201,6 @@ def synthesize_sentence(text, tts, tmp_path, voice_ref_path):
               f"{len(text.split())} words) - attempt {attempt + 1}/{MAX_SENTENCE_TTS_ATTEMPTS}. "
               f"Sentence: {text[:80]!r}")
 
-    # STUTTER-PICK FIX (2026-08-29): every attempt came back anomalous -
-    # previously this used the LAST attempt regardless of quality. A
-    # duplicated/repeated sentence is always LONGER than a clean read, so
-    # the shortest of the batch is the least-stuttered option available.
     best_duration, best_clip = min(attempts, key=lambda a: a[0])
     print(f"Sentence still looks anomalous after {MAX_SENTENCE_TTS_ATTEMPTS} attempts - "
           f"using the SHORTEST of the {len(attempts)} attempts ({best_duration:.1f}s) as the "
