@@ -93,7 +93,7 @@ AGNES_HEADERS = {
     "Content-Type": "application/json",
 }
 
-WIDTH, HEIGHT = 1280, 720
+WIDTH, HEIGHT = 1920, 1080  # RESOLUTION UPGRADE (2026-08-29): Agnes supports up to 1080p, was requesting the 720p tier for no reason
 FRAME_RATE = 24
 
 # RELIABILITY FIX (2026-08-06): 240s (4 min) was frequently shorter than
