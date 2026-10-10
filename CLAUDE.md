@@ -50,13 +50,21 @@ without being asked. Given how many past bugs were "looked successful but wasn't
 never assume a paste succeeded cleanly. Check the file size and that the last lines
 of the file are present, because a paste can be cut off partway.
 
-## 10. Re-check the GitHub Write Block Periodically
-Claude's GitHub write access (create_or_update_file) returns 403 here despite full
-read/write showing on the connector (retested 2026-10-10, still blocked). Periodically
-retest it (try a trivial write); if it's been fixed, drop the copy-paste workaround.
-Likely cause (not confirmed): the connector is signed in as aliwaziri10, but the repo is
-owned by adrian001234. A possible fix is for adrian001234 to add aliwaziri10 as a
-collaborator with write access (repo Settings, Collaborators).
+## 10. How Claude Writes To This Repo (tested 2026-10-11)
+Claude's GitHub connector is signed in as aliwaziri10. It can write to repos owned by
+aliwaziri10 (tested on the fork aliwaziri10/upgraded-journey) but gets 403 "Resource not
+accessible by integration" on this repo, which is owned by adrian001234. The connector's
+access list holds only repos owned by aliwaziri10, so adding a collaborator does not fix
+it. Every Claude profile uses this method instead:
+1. Sync the fork aliwaziri10/upgraded-journey with this repo (Sync fork button; choose
+   "Discard commits" if GitHub offers it). Never edit a stale fork: a pull request from
+   it can bring old files back.
+2. Claude writes the full changed files to a NEW branch on the fork and opens a pull
+   request to adrian001234/upgraded-journey, branch main. If Claude cannot open it, it
+   gives the owner the compare link.
+3. The owner, logged in as the right account, clicks Create pull request, then Merge.
+4. Claude reads the live files and checks size and last lines (Rule 9).
+Retest a direct write to this repo now and then. If it works, drop this method.
 
 ## 11. Read Every Pipeline-Adjacent File Before Changing Any One of Them
 This pipeline is a chain: video -> assembly -> publish. Each stage's code makes
@@ -93,8 +101,8 @@ SHOW_BIBLE.md or PIPELINE.md.
   caused schema mismatches. It was disabled and deleted on 2026-10-10. Do not rebuild it.
 
 ## Access notes
-- GitHub write access via the Claude.ai connector is unreliable (403) even when the
-  connector shows full read/write. Read access works.
+- GitHub write access via the Claude.ai connector to THIS repo is blocked (403). Read
+  access works. Use the fork and pull request method in Rule 10.
 - User has no terminal/SSH access - browser dashboards only (GitHub web editor,
   Supabase, YouTube Studio). Never suggest local dev or CLI commands.
 - Spending rule across his channels: free tools only until the business makes $5,000.
