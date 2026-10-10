@@ -1,0 +1,19 @@
+name: Make Character Sheet
+on:
+  workflow_dispatch:
+jobs:
+  make-picture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Make the character picture
+        env:
+          AGNES_API_KEY: ${{ secrets.AGNES_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: python video/make_character_sheet.py
