@@ -1,8 +1,8 @@
 # Project Instructions - Tiny Lawn Tales (repo: upgraded-journey)
 
-These rules apply to every task in this repo. They exist because past sessions on this
-and sibling projects (Marius, Nova) have hit real bugs and unwanted changes caused by
-skipping them. Follow them even under time pressure.
+These rules apply to every task in this repo. They exist because past sessions on
+this project have hit real bugs and unwanted changes caused by skipping them.
+Follow them even under time pressure.
 
 Read SHOW_BIBLE.md (the show, Nori, the story rules) and PIPELINE.md (how it runs)
 before writing shots or changing any stage.
@@ -46,13 +46,17 @@ selling the tool. Don't recommend an ideal solution the user can't reach.
 
 ## 9. Verify Every Paste Landed Correctly
 After the user pastes a file in and commits, diff what's now live against what was given,
-without being asked. Given how many past bugs were "looked successful but wasn't," never
-assume a paste succeeded cleanly.
+without being asked. Given how many past bugs were "looked successful but wasn't,"
+never assume a paste succeeded cleanly. Check the file size and that the last lines
+of the file are present, because a paste can be cut off partway.
 
 ## 10. Re-check the GitHub Write Block Periodically
 Claude's GitHub write access (create_or_update_file) returns 403 here despite full
 read/write showing on the connector (retested 2026-10-10, still blocked). Periodically
 retest it (try a trivial write); if it's been fixed, drop the copy-paste workaround.
+Likely cause (not confirmed): the connector is signed in as aliwaziri10, but the repo is
+owned by adrian001234. A possible fix is for adrian001234 to add aliwaziri10 as a
+collaborator with write access (repo Settings, Collaborators).
 
 ## 11. Read Every Pipeline-Adjacent File Before Changing Any One of Them
 This pipeline is a chain: video -> assembly -> publish. Each stage's code makes
@@ -75,16 +79,18 @@ SHOW_BIBLE.md or PIPELINE.md.
   account was selected during OAuth. A working upload to the *wrong* channel looks like
   success in logs - always confirm which channel a token is authorized for, not just
   that it works.
-- 2026-08-04/05: one session invented a separate video_shots table and a shots_pending
-  status without reading the adjacent stages, which already used a different schema
-  (shot_list JSON on the pipeline row). Two incompatible designs sat on main until a
-  later session re-read every adjacent file's live content (see Rule 11).
+- One session invented a separate video_shots table and a shots_pending status without
+  reading the adjacent stages, which already used a different schema (shot_list JSON on
+  the pipeline row). Two incompatible designs sat on main until a later session re-read
+  every adjacent file's live content (see Rule 11).
 - 2026-10-10: the Supabase project was paused. SUPABASE_URL then stopped resolving
   ("Name or service not known") and looked like a bad secret. Check whether the
   project is paused before suspecting the secret.
+- 2026-10-10: runs failed with HTTP 503 "model_not_found" and looked like an outage. The
+  real cause was that Agnes retired agnes-video-v2.0 on 2026-09-25. Read the provider's
+  notices before calling an error a temporary outage.
 - The old auto-fixer (autoheal) patched single files with no cross-file awareness and
-  caused schema mismatches. It was disabled in August 2026 and deleted on 2026-10-10.
-  Do not rebuild it.
+  caused schema mismatches. It was disabled and deleted on 2026-10-10. Do not rebuild it.
 
 ## Access notes
 - GitHub write access via the Claude.ai connector is unreliable (403) even when the
