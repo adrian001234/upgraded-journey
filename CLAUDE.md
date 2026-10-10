@@ -4,7 +4,7 @@ These rules apply to every task in this repo. They exist because past sessions o
 this project have hit real bugs and unwanted changes caused by skipping them.
 Follow them even under time pressure.
 
-Read SHOW_BIBLE.md (the show, Nori, the story rules) and PIPELINE.md (how it runs)
+Read SHOW_BIBLE.md (the show, Mimsi, the story rules) and PIPELINE.md (how it runs)
 before writing shots or changing any stage.
 
 ## 1. Think Before Coding
