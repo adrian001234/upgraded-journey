@@ -1,79 +1,23 @@
 """
-TechPulse - Video Generation Stage (LONG-FORM, RESUMABLE)
-Rewritten 2026-08-05 to fix a real, confirmed production failure: the
-previous version rendered ALL shots for a video (up to 63+ on a long-form
-episode) sequentially inside a single pipeline.yml job, but Agnes AI
-allows only 1 request/minute. That job can never finish a long-form
-video's shots in one run, and every retry hits the identical wall - this
-is exactly what happened to row 77b60f3d ("Bending Spoons to buy Airtable
-for $1.28B"): it exhausted all 3 retries and was marked permanently
-'failed' without ever getting past shot 1. That row has been reset back
-to 'narrated' with shot_retry_count=0 so this version can pick it back up.
+Tiny Lawn Tales - Video Generation Stage (resumable, one shot at a time)
 
-NEW DESIGN: this script does ONE shot per invocation, same resumable
-pattern proven in Marius:
-  1. Find the oldest 'narrated' row (or a row already mid-render, tracked
-     via video_urls already having some entries).
-  2. Render exactly the next not-yet-done shot (index = len(video_urls)).
-  3. Upload that one clip, append its URL to video_urls, save.
-  4. If that was the last shot, flip status to 'video_complete' (with
-     the full video_urls array assemble.py already expects - unchanged).
-  5. Exit. The next cron tick renders the next shot - whether that's
-     shot 2 of this same video, or shot 1 of the next one once this one
-     is done. A single Agnes rate-limit failure now costs one shot's
-     worth of delay, not the whole video's retry budget.
+Finds the oldest 'narrated' row in video_pipeline and renders its shots one
+by one with Agnes Video 2.5 Flash, saving progress after every shot.
 
-Frame-count fix (num_frames must be 8n+1) and Agnes endpoints are carried
-over unchanged from the 2026-08-05 schema-fix version of this file.
-
-RELIABILITY FIX (2026-08-06): ported three fixes proven in production on
-Marius's video_generation.py, none of which this file had yet:
-1. RETRY-SAFE submit: submit_agnes_task now retries transient backend
-   errors (429 rate limit, 500/502/503/504 server-side) with backoff
-   before giving up, instead of letting a single flaky response burn one
-   of only 3 total per-shot retries. This matters more here than in
-   Marius specifically because Agnes's documented 1 req/min ceiling for
-   this account means a 429 is an expected, routine event, not a rare
-   edge case - it should never cost real retry budget.
-2. POLL TIMEOUT: raised from 240s (4 min) to 900s (15 min).
-   Marius's own production logs show real Agnes generations taking
-   14-38 minutes under free-tier load; a 4-minute poll timeout was very
-   likely aborting shots that were still legitimately rendering, forcing
-   a full resubmission (and burning another shot_retry_count tick) for
-   work that would have finished on its own.
-3. CONTENT-POLICY-AWARE: submit_agnes_task now raises a distinct
-   ContentPolicyRejection instead of a generic RuntimeError, and main()
-   marks that row permanently 'failed' immediately (not after 3 retries)
-   with the offending prompt logged - a content-policy rejection will
-   never succeed on retry, so spending the per-shot retry budget on it
-   only delays finding out.
-4. CLIP VERIFICATION ON RESUME: before rendering the next shot, HEAD
-   -checks every already-recorded video_urls entry once. A clip whose
-   URL has gone stale/expired is silently dropped and re-rendered,
-   instead of being built into the final assembly as a broken link -
-   same fix Marius already has.
-
-New Supabase column added for this: shot_retry_count (integer, default 0)
-on video_pipeline - tracks retries for the CURRENT shot only, separate
-from any whole-video retry_count used elsewhere.
-
-MULTI-SHOT-PER-RUN FIX (2026-08-09): confirmed via live Actions log that
-this was rendering exactly 1 shot per 5-minute cron tick, so a 63-shot
-long-form video took ~5 hours of real time even though Agnes itself was
-responding promptly - almost all of that time was the job spinning up,
-doing one shot, and exiting, then sitting idle until the next cron tick.
-main() now loops rendering shots within a SINGLE run instead of exiting
-after one, pacing submissions AGNES_MIN_SECONDS_BETWEEN_SUBMITS (65s -
-just over Agnes's documented 1 req/min cap for this account, matching
-the existing rate limit exactly rather than batching shots the way
-Marius does, which would 429-storm this account) apart. A run stops
-looping when: the video (or all currently-ready videos) reaches
-video_complete, MAX_SHOTS_PER_RUN is hit, or elapsed time approaches
-RUN_TIME_BUDGET_SECONDS (leaving headroom under the job's 300-minute
-timeout so a run always exits cleanly rather than getting killed
-mid-shot). This does not change per-shot logic, retry behavior, or the
-resumable one-shot-of-progress-per-save pattern at all - only wraps it
-in a loop instead of running it once per process invocation.
+- Model: agnes-video-2.5-flash (Agnes retired agnes-video-v2.0 on 2026-09-25).
+  720P only, 4 to 12 seconds per shot, asynchronous: create a task with
+  POST /v1/videos, then poll GET /agnesapi?video_id=...&model_name=...
+- Pacing: Agnes allows 1 request per minute on this account, so submissions
+  are spaced AGNES_MIN_SECONDS_BETWEEN_SUBMITS apart.
+- Character reference: if CHARACTER_REFERENCE_URL and CHARACTER_REFERENCE_NAME
+  are both set, any shot whose text contains the character name is rendered in
+  Agnes "reference" mode with the character picture, so she looks the same in
+  every clip. Other shots are rendered text-only.
+- Retries: transient errors (429, 5xx) are retried with backoff. A shot that
+  keeps failing is retried across runs (shot_retry_count), then the row is
+  marked 'failed'. A content-policy rejection fails the row immediately.
+- Resume: video_urls holds finished clips. Before rendering, recorded clip
+  URLs are checked and any dead link is re-rendered.
 """
 import json
 import os
@@ -87,52 +31,32 @@ AGNES_API_KEY = os.environ["AGNES_API_KEY"]
 
 AGNES_SUBMIT_URL = "https://apihub.agnes-ai.com/v1/videos"
 AGNES_POLL_URL = "https://apihub.agnes-ai.com/agnesapi"
-AGNES_MODEL = "agnes-video-v2.0"
+AGNES_MODEL = "agnes-video-2.5-flash"
 AGNES_HEADERS = {
     "Authorization": f"Bearer {AGNES_API_KEY}",
     "Content-Type": "application/json",
 }
 
-WIDTH, HEIGHT = 1920, 1080  # RESOLUTION UPGRADE (2026-08-29): Agnes supports up to 1080p, was requesting the 720p tier for no reason
-FRAME_RATE = 24
+VIDEO_SIZE = "720P"  # Flash supports only "720P"
+ASPECT_RATIO = "16:9"
+MIN_SHOT_SECONDS = 4
+MAX_SHOT_SECONDS = 12
 
-# RELIABILITY FIX (2026-08-06): 240s (4 min) was frequently shorter than
-# real Agnes render time under free-tier load (confirmed 14-38 min in
-# Marius's production logs), causing shots to be abandoned mid-render.
 POLL_MAX_WAIT = 900
 POLL_INTERVAL = 10
 
-# RELIABILITY FIX (2026-08-06): ported from Marius - retry transient
-# backend errors instead of burning per-shot retry budget on them. Agnes's
-# documented 1 req/min ceiling for this account means a 429 here is
-# routine, not exceptional.
 AGNES_RETRYABLE_CODES = {429, 500, 502, 503, 504}
 AGNES_MAX_RETRIES = 4
 
 VIDEO_CLIPS_BUCKET = "video_clips"
-RETRY_LIMIT = 3  # per-SHOT retries now, not per-video
+RETRY_LIMIT = 3  # per-shot retries
 
 CLIP_VERIFY_TIMEOUT = 15
 
-# MULTI-SHOT-PER-RUN FIX (2026-08-09): see file header. 65s keeps every
-# Agnes submission just over 1 per minute, matching this account's
-# documented cap - intentionally NOT batching multiple shots close
-# together the way Marius does, since Marius's account has no such cap.
 AGNES_MIN_SECONDS_BETWEEN_SUBMITS = 65
 MAX_SHOTS_PER_RUN = 30
-# Job timeout is 300 minutes; stop starting new shots once we're within
-# this many seconds of that, so a run always exits cleanly (progress
-# already saved after every shot) instead of getting hard-killed by
-# GitHub mid-render.
 RUN_TIME_BUDGET_SECONDS = 260 * 60
 
-# CHARACTER REFERENCE (2026-10-10): for the wordless Pebble format. When both
-# env vars are set, any shot whose prompt mentions CHARACTER_REFERENCE_NAME is
-# sent to Agnes as image-to-video starting from CHARACTER_REFERENCE_URL (same
-# "image" field Marius uses), so the character looks the same in every clip.
-# Shots that don't mention the name (wide establishing shots, etc.) are
-# rendered text-only exactly as before. If either var is unset, behavior is
-# unchanged from the old TechPulse flow.
 CHARACTER_REFERENCE_URL = os.environ.get("CHARACTER_REFERENCE_URL", "").strip()
 CHARACTER_REFERENCE_NAME = os.environ.get("CHARACTER_REFERENCE_NAME", "").strip().lower()
 
@@ -156,9 +80,8 @@ def _supabase_request(method, path, body=None):
 
 
 def get_next_row_to_render():
-    """Oldest 'narrated' row (whether fresh or already partway through
-    rendering - progress is tracked via how many entries video_urls has,
-    not via a separate status)."""
+    """Oldest 'narrated' row (fresh or partway through rendering; progress is
+    tracked by how many entries video_urls has)."""
     rows = _supabase_request(
         "GET",
         "video_pipeline?status=eq.narrated&order=created_at.asc&limit=1&select=*",
@@ -166,30 +89,30 @@ def get_next_row_to_render():
     return rows[0] if rows else None
 
 
-def frames_for_duration(duration_seconds, frame_rate=FRAME_RATE):
-    """Round to the nearest frame count Agnes accepts (must be 8*n + 1)."""
-    raw = duration_seconds * frame_rate
-    n = max(round((raw - 1) / 8), 1)
-    return 8 * n + 1
+def seconds_for_duration(duration_seconds):
+    """Agnes 2.5 wants the duration as a string between "4" and "12"."""
+    return str(min(max(round(duration_seconds), MIN_SHOT_SECONDS), MAX_SHOT_SECONDS))
 
 
 def submit_agnes_task(prompt, duration_seconds, image_url=None):
-    """RELIABILITY FIX (2026-08-06): retries 429/5xx with backoff instead
-    of surfacing the first transient error straight to main(), where it
-    would burn one of only RETRY_LIMIT=3 total per-shot attempts on
-    something that had nothing to do with the prompt itself. A genuine
-    content-policy rejection (400) is raised immediately as
-    ContentPolicyRejection since retrying that can never succeed."""
+    """Create an Agnes video task and return its video_id. Retries 429/5xx
+    with backoff. A content-policy rejection (400) raises immediately."""
     payload = {
         "model": AGNES_MODEL,
         "prompt": prompt,
-        "height": HEIGHT,
-        "width": WIDTH,
-        "num_frames": frames_for_duration(duration_seconds),
-        "frame_rate": FRAME_RATE,
+        "mode": "text",
+        "seconds": seconds_for_duration(duration_seconds),
+        "size": VIDEO_SIZE,
+        "aspect_ratio": ASPECT_RATIO,
+        "n": 1,
     }
     if image_url:
-        payload["image"] = image_url
+        payload["mode"] = "reference"
+        payload["images"] = [image_url]
+        payload["prompt"] = (
+            "Use the character and art style in <Picture 1> as reference, "
+            "keeping her appearance exactly the same. " + prompt
+        )
     body = json.dumps(payload).encode()
 
     last_error_text = None
@@ -239,7 +162,7 @@ def poll_agnes_task(video_id):
             raise RuntimeError(f"Agnes poll HTTP {e.code}: {error_body}") from e
         status = data.get("status")
         if status == "completed":
-            for key in ("video_url", "url"):
+            for key in ("url", "video_url"):
                 val = data.get(key)
                 if isinstance(val, str) and val.startswith("http"):
                     return val
@@ -257,10 +180,7 @@ def download_file(url, out_path):
 
 
 def verify_clip_url(url):
-    """RELIABILITY FIX (2026-08-06): ported from Marius - HEAD-check an
-    already-recorded clip URL before trusting it. A stale/expired storage
-    URL silently built into the final assembly produces a broken video;
-    catching it here means we just re-render that one shot instead."""
+    """HEAD-check an already-recorded clip URL before trusting it."""
     req = urllib.request.Request(url, method="HEAD")
     try:
         with urllib.request.urlopen(req, timeout=CLIP_VERIFY_TIMEOUT) as resp:
@@ -292,9 +212,8 @@ def upload_clip(row_id, index, local_path):
 
 
 def save_progress(row_id, video_urls, shot_retry_count):
-    """Persist progress after every shot - whether it succeeded (new URL
-    appended) or failed (just the retry counter bumped). Status stays
-    'narrated' until every shot is done."""
+    """Persist progress after every shot. Status stays 'narrated' until every
+    shot is done."""
     _supabase_request("PATCH", f"video_pipeline?id=eq.{row_id}", {
         "video_urls": video_urls,
         "shot_retry_count": shot_retry_count,
@@ -314,11 +233,9 @@ def mark_row_permanently_failed(row_id, reason):
 
 
 def render_one_shot():
-    """Renders exactly the next not-yet-done shot on the oldest 'narrated'
-    row. Returns True if a shot was successfully rendered (progress was
-    made, whether or not that shot completed the video), False if there
-    was nothing to do (no ready row) or the row hit a stopping condition
-    (content-policy fail, permanent fail, or already fully done)."""
+    """Render exactly the next unfinished shot on the oldest 'narrated' row.
+    Returns True if progress was made (or a retry was scheduled), False if
+    there was nothing to do or the row hit a stopping condition."""
     row = get_next_row_to_render()
     if not row:
         print("No 'narrated' rows found. Nothing to do.")
@@ -407,11 +324,10 @@ def render_one_shot():
         if next_retry >= RETRY_LIMIT:
             mark_row_permanently_failed(row_id, f"shot {next_index + 1}/{total_shots} failed {RETRY_LIMIT}x: {e}")
             return False
-        else:
-            print(f"Row {row_id}: shot {next_index + 1}/{total_shots} failed "
-                  f"(attempt {next_retry}/{RETRY_LIMIT}): {e}. Will retry next run.")
-            save_progress(row_id, video_urls, next_retry)
-            return True
+        print(f"Row {row_id}: shot {next_index + 1}/{total_shots} failed "
+              f"(attempt {next_retry}/{RETRY_LIMIT}): {e}. Will retry next run.")
+        save_progress(row_id, video_urls, next_retry)
+        return True
 
 
 def main():
@@ -441,7 +357,7 @@ def main():
             print(f"Pacing {remaining_pace:.0f}s before next Agnes submission (staying under 1 req/min)...")
             time.sleep(remaining_pace)
 
-    print(f"Run finished: {shots_this_run} shot(s) rendered this run.")
+    print(f"Run finished: {shots_this_run} shot(s) processed this run.")
 
 
 if __name__ == "__main__":
