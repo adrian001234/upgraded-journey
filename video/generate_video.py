@@ -13,9 +13,14 @@ by one with Agnes Video 2.5 Flash, saving progress after every shot.
   are both set, any shot whose text contains the character name is rendered in
   Agnes "reference" mode with the character picture, so she looks the same in
   every clip. Other shots are rendered text-only.
-- Retries: transient errors (429, 5xx) are retried with backoff. A shot that
-  keeps failing is retried across runs (shot_retry_count), then the row is
-  marked 'failed'. A content-policy rejection fails the row immediately.
+- Queue full: when Agnes answers 503 video_queue_full, the code waits
+  AGNES_QUEUE_FULL_WAIT_SECONDS and tries again, up to
+  AGNES_QUEUE_FULL_MAX_ATTEMPTS times in one run. If the queue is still full,
+  the run stops and the row stays 'narrated' WITHOUT using up a retry, so the
+  next scheduled run tries again.
+- Retries: other transient errors (429, other 5xx) are retried with backoff. A
+  shot that keeps failing is retried across runs (shot_retry_count), then the
+  row is marked 'failed'. A content-policy rejection fails the row immediately.
 - Resume: video_urls holds finished clips. Before rendering, recorded clip
   URLs are checked and any dead link is re-rendered.
 """
@@ -48,6 +53,9 @@ POLL_INTERVAL = 10
 AGNES_RETRYABLE_CODES = {429, 500, 502, 503, 504}
 AGNES_MAX_RETRIES = 4
 
+AGNES_QUEUE_FULL_WAIT_SECONDS = 180
+AGNES_QUEUE_FULL_MAX_ATTEMPTS = 20
+
 VIDEO_CLIPS_BUCKET = "video_clips"
 RETRY_LIMIT = 3  # per-shot retries
 
@@ -62,6 +70,10 @@ CHARACTER_REFERENCE_NAME = os.environ.get("CHARACTER_REFERENCE_NAME", "").strip(
 
 
 class ContentPolicyRejection(Exception):
+    pass
+
+
+class QueueFull(Exception):
     pass
 
 
@@ -96,7 +108,9 @@ def seconds_for_duration(duration_seconds):
 
 def submit_agnes_task(prompt, duration_seconds, image_url=None):
     """Create an Agnes video task and return its video_id. Retries 429/5xx
-    with backoff. A content-policy rejection (400) raises immediately."""
+    with backoff. A content-policy rejection (400) raises immediately. A full
+    queue (503 video_queue_full) waits and retries without using up the normal
+    retries, and raises QueueFull if it stays full."""
     payload = {
         "model": AGNES_MODEL,
         "prompt": prompt,
@@ -116,7 +130,9 @@ def submit_agnes_task(prompt, duration_seconds, image_url=None):
     body = json.dumps(payload).encode()
 
     last_error_text = None
-    for attempt in range(AGNES_MAX_RETRIES):
+    attempt = 0
+    queue_full_count = 0
+    while attempt < AGNES_MAX_RETRIES:
         req = urllib.request.Request(AGNES_SUBMIT_URL, data=body, method="POST", headers=AGNES_HEADERS)
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
@@ -125,10 +141,19 @@ def submit_agnes_task(prompt, duration_seconds, image_url=None):
             error_body = e.read().decode(errors="replace")[:500]
             if e.code == 400 and "content_policy_violation" in error_body:
                 raise ContentPolicyRejection(error_body)
+            if e.code == 503 and "video_queue_full" in error_body:
+                queue_full_count += 1
+                if queue_full_count >= AGNES_QUEUE_FULL_MAX_ATTEMPTS:
+                    raise QueueFull(error_body)
+                print(f"Agnes video queue is full (try {queue_full_count}/{AGNES_QUEUE_FULL_MAX_ATTEMPTS}). "
+                      f"Waiting {AGNES_QUEUE_FULL_WAIT_SECONDS}s before trying again...")
+                time.sleep(AGNES_QUEUE_FULL_WAIT_SECONDS)
+                continue
             if e.code in AGNES_RETRYABLE_CODES:
+                attempt += 1
                 last_error_text = f"HTTP {e.code}: {error_body}"
-                wait = 20 * (attempt + 1)
-                print(f"Agnes submit transient error {e.code} (attempt {attempt + 1}/{AGNES_MAX_RETRIES}): {error_body}")
+                wait = 20 * attempt
+                print(f"Agnes submit transient error {e.code} (attempt {attempt}/{AGNES_MAX_RETRIES}): {error_body}")
                 print(f"Retrying in {wait}s...")
                 time.sleep(wait)
                 continue
@@ -319,6 +344,10 @@ def render_one_shot():
             f"Prompt was: {prompt!r}. Reword shot_list[{next_index}] and reset status to 'narrated' to resume.",
         )
         return False
+    except QueueFull as e:
+        print(f"Row {row_id}: Agnes video queue is still full after {AGNES_QUEUE_FULL_MAX_ATTEMPTS} tries. "
+              f"The row stays 'narrated' and no retry was used up. The next scheduled run will try again. {e}")
+        return False
     except Exception as e:
         next_retry = shot_retry_count + 1
         if next_retry >= RETRY_LIMIT:
@@ -326,39 +355,4 @@ def render_one_shot():
             return False
         print(f"Row {row_id}: shot {next_index + 1}/{total_shots} failed "
               f"(attempt {next_retry}/{RETRY_LIMIT}): {e}. Will retry next run.")
-        save_progress(row_id, video_urls, next_retry)
-        return True
-
-
-def main():
-    run_start = time.monotonic()
-    shots_this_run = 0
-
-    while shots_this_run < MAX_SHOTS_PER_RUN:
-        elapsed = time.monotonic() - run_start
-        if elapsed >= RUN_TIME_BUDGET_SECONDS:
-            print(f"Run time budget ({RUN_TIME_BUDGET_SECONDS}s) reached after {shots_this_run} shot(s) - "
-                  f"stopping cleanly, next scheduled run continues.")
-            break
-
-        shot_start = time.monotonic()
-        made_progress = render_one_shot()
-        if not made_progress:
-            break
-        shots_this_run += 1
-
-        time_spent_on_shot = time.monotonic() - shot_start
-        remaining_pace = AGNES_MIN_SECONDS_BETWEEN_SUBMITS - time_spent_on_shot
-        if remaining_pace > 0 and shots_this_run < MAX_SHOTS_PER_RUN:
-            elapsed = time.monotonic() - run_start
-            if elapsed + remaining_pace >= RUN_TIME_BUDGET_SECONDS:
-                print(f"Pacing sleep would exceed the run time budget - stopping after {shots_this_run} shot(s) instead.")
-                break
-            print(f"Pacing {remaining_pace:.0f}s before next Agnes submission (staying under 1 req/min)...")
-            time.sleep(remaining_pace)
-
-    print(f"Run finished: {shots_this_run} shot(s) processed this run.")
-
-
-if __name__ == "__main__":
-    main()
+        save_progress(row_id, video_urls,
