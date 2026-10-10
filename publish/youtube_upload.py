@@ -1,45 +1,29 @@
 """
-TechPulse - Publish Stage (Supabase-native, matched by row id)
+Tiny Lawn Tales - Publish Stage (Supabase-native, matched by row id)
 Pulls the next Supabase video_pipeline row with status='video_generated',
 downloads its video_url, uploads it to YouTube, and updates that SAME
 row (by id) with status="published", youtube_video_id, youtube_url, and
 published_at.
 
-FIXED (2026-08-04): the old version matched rows back together by
-title + source TEXT after the fact, which is exactly the kind of match
-that silently breaks on whitespace/truncation differences - the likely
-cause of the previous publish/tracking discrepancy (YOUTUBE_READY=true
-for weeks with zero published rows despite at least one real upload).
-Now that every row has had a single stable id since the script stage
-created it, there is no text matching involved at all - this stage reads
-the row's own id and writes back to that exact id, full stop.
+STATUS: this stage is gated in pipeline.yml behind the repo variable
+YOUTUBE_READY and must stay off until the new channel is ready. It still
+needs a review for the new channel: title and description, tags,
+thumbnail, and the "made for kids" setting. Before any upload, confirm
+which YouTube channel the refresh token is authorized for.
 
-RETRY LOGIC (2026-08-05): previously any failure (download error, YouTube
-API error) permanently marked the row status='failed' with no automatic
-retry. Now failures leave the row's status untouched (it's already
-'video_generated' with youtube_video_id still null, so the next run's
-query naturally picks it up again) and just increment retry_count, up
-to RETRY_LIMIT times, before finally marking it permanently failed so a
-human notices.
+RETRY LOGIC: failures leave the row's status untouched (it is still
+'video_generated' with youtube_video_id null, so the next run picks it up
+again) and increment retry_count, up to RETRY_LIMIT times, before marking
+the row permanently failed so a human notices.
 
-FIXED (2026-08-05): YouTube rejects any video title over 100 characters
-with "invalid or empty video title" - a confusing error for what's
-actually a length problem, not an empty-string problem. The headline
-"Google nixes its Earth AI feature one day after launch, amid criticism
-it would spread misinformation" is 101 characters and hit exactly this.
-Titles are now truncated to 100 characters at the last whole word before
-being sent to YouTube - the full original headline is unaffected anywhere
-else (Supabase title column, narration, etc.), only what's sent to the
-YouTube API is shortened.
+TITLE LENGTH: YouTube rejects titles over 100 characters. Titles are
+truncated to 100 characters at the last whole word before being sent to
+YouTube. The full original title is unaffected in Supabase.
 
-STORAGE CLEANUP (2026-09-10): once a row is confirmed published (mark_published
-has succeeded), its source video file no longer needs to sit in Supabase
-Storage. delete_video_from_storage() parses the bucket/object path out of
-the row's own video_url and issues a Storage API delete - best-effort,
-never raises, same non-fatal contract as every other cleanup step in this
-pipeline. Placed after mark_published so a cleanup failure can never be
-mistaken for a publish failure (the row already reflects reality by the
-time this could fail).
+STORAGE CLEANUP: once a row is confirmed published (mark_published has
+succeeded), its source video file is deleted from Supabase Storage. This is
+best-effort and never raises, and it runs after mark_published so a cleanup
+failure can never be mistaken for a publish failure.
 """
 import os
 import re
@@ -103,19 +87,18 @@ def mark_failed(row_id, reason, retry_count):
 
 
 def download(url, out_path):
-    resp = requests.get(url, headers={"User-Agent": "TechPulse/1.0"}, timeout=300)
+    resp = requests.get(url, headers={"User-Agent": "TinyLawnTales/1.0"}, timeout=300)
     resp.raise_for_status()
     with open(out_path, "wb") as f:
         f.write(resp.content)
 
 
 def delete_video_from_storage(video_url):
-    """STORAGE CLEANUP (2026-09-10): parses the bucket + object path out of
-    a Supabase Storage URL and deletes it via the Storage REST API. Never
-    raises - a failed cleanup should never affect publish status, which is
-    already recorded in Supabase by the time this runs. Silently no-ops if
-    video_url isn't a recognizable Supabase Storage URL (e.g. already
-    migrated to a different host)."""
+    """Parses the bucket + object path out of a Supabase Storage URL and
+    deletes it via the Storage REST API. Never raises - a failed cleanup
+    should never affect publish status, which is already recorded in
+    Supabase by the time this runs. Silently no-ops if video_url is not a
+    recognizable Supabase Storage URL."""
     if not video_url:
         return
     match = STORAGE_URL_PATTERN.search(video_url)
@@ -158,7 +141,7 @@ def build_youtube_title(title):
     last_space = truncated.rfind(" ")
     if last_space > 0:
         truncated = truncated[:last_space]
-    return truncated.rstrip(" ,.-") 
+    return truncated.rstrip(" ,.-")
 
 
 def upload_to_youtube(youtube, title, description, local_path):
@@ -183,61 +166,4 @@ def mark_published(row_id, youtube_video_id):
         headers=HEADERS,
         json={
             "status": "published",
-            "youtube_video_id": youtube_video_id,
-            "youtube_url": youtube_url,
-            "published_at": datetime.now(timezone.utc).isoformat(),
-        },
-        timeout=30,
-    )
-    if resp.status_code >= 400:
-        print(f"  WARNING: could not write publish status back to Supabase for row {row_id} "
-              f"({resp.status_code}): {resp.text} - youtube_video_id={youtube_video_id} "
-              f"(the YouTube upload itself still succeeded).")
-    else:
-        print(f"  Row {row_id} marked published in Supabase.")
-
-
-def main():
-    row = get_next_video_generated_row()
-    if not row:
-        print("No 'video_generated' rows ready to publish. Nothing to do.")
-        return
-
-    row_id = row["id"]
-    retry_count = row.get("retry_count") or 0
-    title = row.get("title", "untitled")
-    narration_text = row.get("script", "")
-    video_url = row.get("video_url")
-
-    if not video_url:
-        mark_failed(row_id, "video_generated row has no video_url", retry_count)
-        return
-
-    os.makedirs(TMP_DIR, exist_ok=True)
-    local_path = f"{TMP_DIR}/{row_id}.mp4"
-
-    try:
-        print(f"Downloading final video for '{title}'...")
-        download(video_url, local_path)
-
-        youtube = get_youtube_client()
-        print(f"Uploading '{title}' to YouTube...")
-        youtube_video_id = upload_to_youtube(youtube, title, narration_text, local_path)
-        print(f"Uploaded: {title} -> {youtube_video_id}")
-
-        mark_published(row_id, youtube_video_id)
-
-        # STORAGE CLEANUP (2026-09-10): only runs after mark_published, and
-        # never raises - see delete_video_from_storage's docstring.
-        delete_video_from_storage(video_url)
-
-    except Exception as e:
-        print(f"ERROR publishing '{title}' (row {row_id}): {e}")
-        mark_failed(row_id, str(e), retry_count)
-    finally:
-        if os.path.exists(local_path):
-            os.remove(local_path)
-
-
-if __name__ == "__main__":
-    main()
+            "youtube_video_id":
