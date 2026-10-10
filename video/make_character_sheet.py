@@ -10,7 +10,7 @@ Run it once from GitHub Actions (or anywhere with the env vars below). It:
   4. prints the permanent URL to use as the CHARACTER_REFERENCE_URL variable.
 
 Env vars needed: SUPABASE_URL, SUPABASE_ANON_KEY, AGNES_API_KEY
-Optional: CHARACTER_NAME (default "pebble"), CHARACTER_PROMPT (to override the picture prompt)
+Optional: CHARACTER_NAME (default "pip"), CHARACTER_PROMPT (to override the picture prompt)
 """
 import json
 import os
@@ -22,21 +22,21 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_ANON_KEY = os.environ["SUPABASE_ANON_KEY"]
 AGNES_API_KEY = os.environ["AGNES_API_KEY"]
 
-NAME = os.environ.get("CHARACTER_NAME", "pebble").strip().lower()
+NAME = os.environ.get("CHARACTER_NAME", "pip").strip().lower()
 BUCKET = "video_clips"
 AGNES_IMAGE_URL = "https://apihub.agnes-ai.com/v1/images/generations"
 AGNES_IMAGE_MODEL = "agnes-image-2.1-flash"
 SIZE = "1920x1080"
 
 DEFAULT_PROMPT = (
-    "Pebble, a small round grey pillbug (isopod). Smooth segmented armored shell, "
-    "six tiny legs, two very big round shiny black eyes on the front of his face, "
-    "and ONE small bright orange dot painted on the top of his shell, in the middle of his back. "
-    "The orange dot is clearly visible and is the only orange thing on him. "
-    "Photoreal 3D animated insect, macro lens, standing on green grass in a sunny park, "
+    "Pip, a small cute garden snail with a friendly happy face. Soft pale tan-yellow body, "
+    "two short eyestalks, each with one big round shiny black eye with a tiny white highlight, "
+    "a small closed smiling mouth, and a smooth bright orange spiral shell with one cream-colored "
+    "swirl line on it. The shell is bright orange and is his most recognizable feature. "
+    "Photoreal 3D animated macro-world character, standing on green grass in a sunny park, "
     "bright natural daylight, soft shallow depth of field, full body clearly visible, "
-    "seen from slightly above and to the side so the whole top of his shell and the orange dot "
-    "on his back are in view, character centered, nothing else in the frame."
+    "seen from the side and slightly in front so both eyes and the whole shell are in view, "
+    "character centered, nothing else in the frame."
 )
 PROMPT = os.environ.get("CHARACTER_PROMPT", "").strip() or DEFAULT_PROMPT
 
