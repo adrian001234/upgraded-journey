@@ -1,10 +1,10 @@
-name: TechPulse Pipeline
+name: Tiny Lawn Tales Pipeline
 on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
 concurrency:
-  group: techpulse-pipeline
+  group: tiny-lawn-tales-pipeline
   cancel-in-progress: false
 jobs:
   run-pipeline:
@@ -16,71 +16,17 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Check whether a new story should be started
-        id: gate
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-        run: |
-          python3 - <<'PYEOF'
-          import os, json, urllib.request, sys
-
-          url = os.environ.get("SUPABASE_URL", "")
-          key = os.environ.get("SUPABASE_ANON_KEY", "")
-          gh_output = os.environ["GITHUB_OUTPUT"]
-
-          if not url or not key:
-              print("Supabase creds missing - allowing a new story to start to be safe.")
-              with open(gh_output, "a") as f:
-                  f.write("start_new_story=true\n")
-              sys.exit(0)
-
-          req = urllib.request.Request(
-              f"{url}/rest/v1/video_pipeline?select=id&status=in.(scripted,narrated,video_complete)&limit=1",
-              headers={"apikey": key, "Authorization": f"Bearer {key}"},
-          )
-          try:
-              with urllib.request.urlopen(req, timeout=30) as resp:
-                  rows = json.loads(resp.read())
-          except Exception as e:
-              print(f"Could not reach Supabase ({e}) - allowing a new story to start to be safe.")
-              with open(gh_output, "a") as f:
-                  f.write("start_new_story=true\n")
-              sys.exit(0)
-
-          in_progress = len(rows) > 0
-          print(f"Story already in progress: {in_progress}")
-          with open(gh_output, "a") as f:
-              f.write(f"start_new_story={'false' if in_progress else 'true'}\n")
-          PYEOF
       - name: Install dependencies
-        run: pip install feedparser requests pydub google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2 chatterbox-tts
+        run: pip install requests pydub google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
-      - name: Research stage
-        if: steps.gate.outputs.start_new_story == 'true'
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-        run: python research/sources.py
-      - name: Script stage
-        if: steps.gate.outputs.start_new_story == 'true'
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: python script/generate_script.py
-      - name: Narration stage
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-          CHATTERBOX_VOICE_REF_URL: ${{ vars.CHATTERBOX_VOICE_REF_URL }}
-        run: python narration/generate_narration.py
       - name: Video stage
         env:
           AGNES_API_KEY: ${{ secrets.AGNES_API_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          CHARACTER_REFERENCE_URL: ${{ vars.CHARACTER_REFERENCE_URL }}
+          CHARACTER_REFERENCE_NAME: ${{ vars.CHARACTER_REFERENCE_NAME }}
         run: python video/generate_video.py
       - name: Assembly stage
         env:
