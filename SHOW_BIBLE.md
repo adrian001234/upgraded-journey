@@ -9,10 +9,11 @@ Written 2026-10-10, updated 2026-10-11 (hero renamed from Nori to Mimsi). Update
 - Look: photoreal 3D macro-world, sunny lawn, Minuscule-style backgrounds.
 
 ## The hero: Mimsi the snail (girl)
-Spelled M-I-M-S-I, always, with an "i" at the end.
+Spelled M-I-M-S-I, always, with an "i" at the end (owner confirmed 2026-10-11).
 Reference picture (saved in Supabase):
-https://dbdtwhzlmzhyidpmeymn.supabase.co/storage/v1/object/public/video_clips/refs/pip.png
-(The file is called pip.png only because that was her first name. Do not rename it.)
+https://dbdtwhzlmzhyidpmeymn.supabase.co/storage/v1/object/public/video_clips/refs/mimsi.png
+(The file used to be called pip.png and was renamed to mimsi.png. The repo variable
+CHARACTER_REFERENCE_URL must point to refs/mimsi.png.)
 
 Repeat this EXACT description in every shot she appears in. The video model has no
 memory between clips. Every shot that features her must contain the exact words
