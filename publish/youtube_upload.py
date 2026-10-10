@@ -166,4 +166,61 @@ def mark_published(row_id, youtube_video_id):
         headers=HEADERS,
         json={
             "status": "published",
-            "youtube_video_id":
+            "youtube_video_id": youtube_video_id,
+            "youtube_url": youtube_url,
+            "published_at": datetime.now(timezone.utc).isoformat(),
+        },
+        timeout=30,
+    )
+    if resp.status_code >= 400:
+        print(f"  WARNING: could not write publish status back to Supabase for row {row_id} "
+              f"({resp.status_code}): {resp.text} - youtube_video_id={youtube_video_id} "
+              f"(the YouTube upload itself still succeeded).")
+    else:
+        print(f"  Row {row_id} marked published in Supabase.")
+
+
+def main():
+    row = get_next_video_generated_row()
+    if not row:
+        print("No 'video_generated' rows ready to publish. Nothing to do.")
+        return
+
+    row_id = row["id"]
+    retry_count = row.get("retry_count") or 0
+    title = row.get("title", "untitled")
+    narration_text = row.get("script", "")
+    video_url = row.get("video_url")
+
+    if not video_url:
+        mark_failed(row_id, "video_generated row has no video_url", retry_count)
+        return
+
+    os.makedirs(TMP_DIR, exist_ok=True)
+    local_path = f"{TMP_DIR}/{row_id}.mp4"
+
+    try:
+        print(f"Downloading final video for '{title}'...")
+        download(video_url, local_path)
+
+        youtube = get_youtube_client()
+        print(f"Uploading '{title}' to YouTube...")
+        youtube_video_id = upload_to_youtube(youtube, title, narration_text, local_path)
+        print(f"Uploaded: {title} -> {youtube_video_id}")
+
+        mark_published(row_id, youtube_video_id)
+
+        # Only runs after mark_published, and never raises - see
+        # delete_video_from_storage's docstring.
+        delete_video_from_storage(video_url)
+
+    except Exception as e:
+        print(f"ERROR publishing '{title}' (row {row_id}): {e}")
+        mark_failed(row_id, str(e), retry_count)
+    finally:
+        if os.path.exists(local_path):
+            os.remove(local_path)
+
+
+if __name__ == "__main__":
+    main()
