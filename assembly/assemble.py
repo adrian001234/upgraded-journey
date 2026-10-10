@@ -1,23 +1,22 @@
 """
-TechPulse - Assembly Stage (long-form, Supabase-native)
+Tiny Lawn Tales - Assembly Stage (Supabase-native)
 Pulls the next Supabase video_pipeline row with status='video_complete',
-downloads its shot clips (video_urls) and narration audio (narration_url),
+downloads its shot clips (video_urls) and its audio track (narration_url),
 fits each clip to its own shot_durations[i] (trim if long, freeze-extend
 last frame if short), concatenates, mixes in a low ambient bed under the
-narration, muxes the final video, uploads it to Supabase Storage, and
+audio track, muxes the final video, uploads it to Supabase Storage, and
 updates that SAME row (by id) with video_url + status='video_generated'.
 
-This replaces the old file-handoff design (assembly/latest_final.json ->
-tracking stage inserting a NEW row) - now there is only ever one row per
-video, created once by the script stage and updated in place by every
-stage after, so nothing downstream ever has to match rows back together
-by title/source text.
+STATUS: this is still the first version of this stage. It requires a
+narration_url and mixes it with a quiet ambient bed. Tiny Lawn Tales has no
+narration, so this stage needs a rewrite for music and sound effects.
 
-RETRY LOGIC (2026-08-05): previously any failure permanently marked the
-row status='failed' with no automatic retry. Now failures requeue the
-row back to status='video_complete' (so the next run picks it up again)
-up to RETRY_LIMIT times, tracked via a retry_count column, before giving
-up and marking it permanently failed.
+There is only ever one row per video, and every stage updates that row in
+place, so nothing downstream has to match rows by title text.
+
+RETRY LOGIC: failures requeue the row back to status='video_complete' (so
+the next run picks it up again) up to RETRY_LIMIT times, tracked via a
+retry_count column, before giving up and marking it permanently failed.
 """
 import json
 import os
@@ -76,7 +75,7 @@ def mark_failed(row_id, reason, retry_count):
 
 
 def download(url, out_path):
-    resp = requests.get(url, headers={"User-Agent": "TechPulse/1.0"}, timeout=180)
+    resp = requests.get(url, headers={"User-Agent": "TinyLawnTales/1.0"}, timeout=180)
     resp.raise_for_status()
     with open(out_path, "wb") as f:
         f.write(resp.content)
