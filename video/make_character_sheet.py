@@ -30,10 +30,13 @@ SIZE = "1920x1080"
 
 DEFAULT_PROMPT = (
     "Pebble, a small round grey pillbug (isopod). Smooth segmented armored shell, "
-    "six tiny legs, two big shiny black eyes, and ONE small orange dot in the middle of his back. "
+    "six tiny legs, two very big round shiny black eyes on the front of his face, "
+    "and ONE small bright orange dot painted on the top of his shell, in the middle of his back. "
+    "The orange dot is clearly visible and is the only orange thing on him. "
     "Photoreal 3D animated insect, macro lens, standing on green grass in a sunny park, "
     "bright natural daylight, soft shallow depth of field, full body clearly visible, "
-    "three-quarter view, character centered, nothing else in the frame."
+    "seen from slightly above and to the side so the whole top of his shell and the orange dot "
+    "on his back are in view, character centered, nothing else in the frame."
 )
 PROMPT = os.environ.get("CHARACTER_PROMPT", "").strip() or DEFAULT_PROMPT
 
