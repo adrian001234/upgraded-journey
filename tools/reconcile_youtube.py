@@ -1,13 +1,17 @@
 """
-TechPulse - One-off Reconciliation Script (2026-08-05)
+Tiny Lawn Tales - YouTube Reconciliation Script (manual button only)
 
-Reads every video actually on the YouTube channel (source of truth) via
-the YouTube Data API, and repairs video_pipeline in Supabase to match:
+Reads every video actually on the YouTube channel that the refresh token is
+authorized for (source of truth) via the YouTube Data API, and repairs
+video_pipeline in Supabase to match:
 
 - If a Supabase row exists whose (truncated) title matches a YouTube
   video, and that row's youtube_video_id is still null, fill it in.
 - If no row matches at all (e.g. it was deleted, or never had a row),
   insert a new row so the video is tracked going forward.
+
+WARNING: run this only after confirming which YouTube channel the refresh
+token belongs to. It copies EVERY video on that channel into video_pipeline.
 
 This script NEVER deletes or modifies anything on YouTube. It only
 reads from YouTube and writes to Supabase. Safe to re-run any number
