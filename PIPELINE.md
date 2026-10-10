@@ -1,66 +1,67 @@
-# TechPulse Pipeline — Status
+# Tiny Lawn Tales Pipeline - Status
 
-Last verified live against GitHub + Supabase: 2026-08-06.
-Re-verify against live data before trusting this doc at face value — it drifts.
+Last verified live against GitHub + Supabase: 2026-10-10.
+Re-verify against live data before trusting this doc at face value - it drifts.
+Show rules, the hero (Nori the snail) and the story plan live in SHOW_BIBLE.md.
 
-## Architecture (long-form, single workflow, Supabase-native)
+## History
+The repo used to be the TechPulse news channel. On 2026-10-10 the news stages
+(research, script, narration), the old tracking script, the auto-fixer and the
+credit reminder bot were deleted. The pipeline is now a wordless 3D comedy channel.
 
-One GitHub Actions workflow (`.github/workflows/pipeline.yml`), cron every 5
-minutes, `concurrency: techpulse-pipeline` with `cancel-in-progress: false`
-so overlapping triggers queue instead of racing. `timeout-minutes: 300`.
+## Architecture (single workflow, Supabase-native)
 
-Every video is a single `video_pipeline` row in Supabase, created once by
-the script stage and updated in place by every stage after it — nothing
-downstream ever matches rows back together by title/text.
+One GitHub Actions workflow (.github/workflows/pipeline.yml, named "Tiny Lawn Tales
+Pipeline"), cron every 5 minutes, concurrency group tiny-lawn-tales-pipeline with
+cancel-in-progress false so overlapping triggers queue instead of racing.
+timeout-minutes 300.
 
-Status progression: `scripted` → `narrated` → `video_complete` →
-`video_generated` → `published` (or `failed` at any stage after
-`RETRY_LIMIT` exhausted, where retry logic exists).
+Every episode is a single video_pipeline row in Supabase, updated in place by every
+stage. Nothing downstream matches rows by title or text.
 
-**Gate step** (runs every tick, before anything else): if any row has
-`status in (scripted, narrated, video_complete)`, a story is already in
-progress and Research/Script are skipped this tick — only Narration/Video/
-Assembly/Publish run, each picking up whatever's oldest at their own stage.
+Episodes are NOT created by a script stage any more. A row is inserted by hand
+(with Claude's help) already at status 'narrated'.
+
+Status progression: narrated -> video_complete -> video_generated -> published
+(or failed after RETRY_LIMIT, where retry logic exists).
 
 | Stage | File | Reads | Writes | Notes |
 |---|---|---|---|---|
-| Research | `research/sources.py` | RSS feeds, `video_pipeline` (dedup check) | `research/latest_headlines.json` | Dedup by `link`, falls back to exact `title` match if link is empty (fixed 2026-08-06) |
-| Script | `script/generate_script.py` | `latest_headlines.json` | new row: `script`, `shot_list` (JSON, `{narration_excerpt, visual_description}` per shot), `status='scripted'` | Gemini `gemini-3.5-flash-lite`, ~900-1100 word narration, 45 shots |
-| Narration | `narration/generate_narration.py` | oldest `status='scripted'` row | `narration_url`, `shot_durations`, `status='narrated'` | Chatterbox TTS, per-sentence synthesis, voice=Mark F. Smith (LibriVox), `TEMPO_FACTOR=1.25` |
-| Video | `video/generate_video.py` | oldest `status='narrated'` row (`shot_list` + `shot_durations`) | `video_urls`, `status='video_complete'` | Agnes API, one shot at a time, sized to real narration timing (not hardcoded) |
-| Assembly | `assembly/assemble.py` | oldest `status='video_complete'` row | `video_url`, `status='video_generated'` | ffmpeg concat + ambient bed mix; has `retry_count`/`RETRY_LIMIT=3`, requeues to `video_complete` on failure instead of failing permanently |
-| Publish | `publish/youtube_upload.py` | oldest `status='video_generated'` row with `youtube_video_id is null` | `youtube_video_id`, `youtube_url`, `published_at`, `status='published'` | Gated behind repo variable `YOUTUBE_READY` (confirmed `true`, permanent). Matches by stable row `id`, not text. Retries via `retry_count` before permanent `failed`. |
+| Video | video/generate_video.py | oldest status='narrated' row (shot_list + shot_durations) | video_urls, status='video_complete' | Agnes API, one shot at a time, paced 65s (1 request/minute cap). If vars CHARACTER_REFERENCE_URL and CHARACTER_REFERENCE_NAME are set, any shot whose text contains the name ("Nori the snail") starts from her reference picture. |
+| Assembly | assembly/assemble.py | oldest status='video_complete' row | video_url, status='video_generated' | ffmpeg concat plus audio. Still the OLD news version: it requires narration_url and mixes it with a quiet ambient bed. Needs a rewrite for music and sound effects. |
+| Publish | publish/youtube_upload.py | oldest status='video_generated' row with youtube_video_id null | youtube_video_id, youtube_url, published_at, status='published' | Gated behind repo variable YOUTUBE_READY. Currently set to false on purpose. Not yet reviewed or updated for the new channel (title, description, tags, thumbnail, made-for-kids). |
+
+Other workflows: make_character_sheet.yml (manual button, makes the character
+reference picture), reconcile_youtube.yml (manual, checks YouTube against Supabase).
+
+## Repo settings the pipeline depends on
+- Secrets: AGNES_API_KEY, SUPABASE_URL, SUPABASE_ANON_KEY, YT_CLIENT_ID,
+  YT_CLIENT_SECRET, YT_REFRESH_TOKEN
+- Variables: CHARACTER_REFERENCE_URL, CHARACTER_REFERENCE_NAME ("Nori the snail"),
+  YOUTUBE_READY (false until the channel is ready)
+
+## Still to do (in order)
+1. Write the full 40-shot list for Episode 1 and insert it as a 'narrated' row.
+2. Sound: music plus sound effects (free sources only). Rewrite assembly for it.
+3. Update publish for the new channel; confirm which YouTube channel the refresh
+   token is authorized for BEFORE any upload; set "made for kids" correctly.
+4. Rename the YouTube channel to Tiny Lawn Tales in YouTube Studio.
+5. Only then set YOUTUBE_READY back to true.
 
 ## Known-good fixes already live (don't re-break these)
-- Script/Narration/Video schema is fully aligned on `shot_list` /
-  `narration_excerpt` / `visual_description` / `shot_durations` — all three
-  files were mismatched against each other until 2026-08-05; verify all
-  three still agree before editing any one of them in isolation.
-- `timeout-minutes: 300` (raised from 20 on 2026-08-06) — Chatterbox TTS is
-  a real per-sentence CPU inference (60-90 sentences for a long-form
-  script) plus up to 45 sequential Agnes shot generations in the same job;
-  20 min was silently killing runs mid-pipeline.
-- Research dedup checks `title` as a fallback when RSS `link` is empty —
-  don't revert to link-only dedup.
-- Assembly and Publish both match by row `id`, retry via `retry_count`
-  before permanent `failed` — don't reintroduce text-based matching.
+- Video, Assembly and Publish agree on shot_list / visual_description /
+  shot_durations / video_urls. Verify the neighbours before editing any one stage.
+- timeout-minutes 300: up to 45 sequential Agnes shots can run in one job.
+- Assembly and Publish match by row id and retry via retry_count before permanent
+  failed. Don't reintroduce text-based matching.
+- Agnes content-policy rejection fails the row immediately. Reword that shot in
+  shot_list and reset the row to 'narrated' to resume.
 
-## Standing risks (flagged, not fixed — decide before touching)
-- **`autoheal/heal.py`** (triggered by `.github/workflows/auto_heal.yml` on
-  any pipeline failure) asks Gemini to patch one file in isolation from a
-  traceback and commits straight to `main` via its own `GITHUB_TOKEN` —
-  bypasses the 403 that blocks all other GitHub write access to this repo.
-  Zero cross-file schema awareness; this is what produced the Script/
-  Narration/Video mismatch on 2026-08-04. **Currently disabled by Zia
-  (2026-08-06).** Re-enabling it without a cross-file consistency check is
-  a real risk of re-breaking the schema fix above.
-- `public.video_shots` table: RLS disabled (anon key can read/write it),
-  and no longer used by the rewritten `generate_video.py`. Candidate for
-  dropping entirely rather than just enabling RLS — pending confirmation.
-
-## GitHub write access
-`create_or_update_file` and `push_files` both confirmed 403 on this repo
-(retested 2026-08-05) — not intermittent, not an exception to the Nova/
-Marius pattern. All edits go through the GitHub web editor:
-give the exact `https://github.com/adrian001234/upgraded-journey/edit/main/<path>`
-link and full file content, Zia pastes and commits, then re-verify live.
+## Standing risks
+- Supabase free projects can be paused. On 2026-10-10 the project was paused, which
+  made SUPABASE_URL stop resolving ("Name or service not known" in the logs) and
+  looked like a wrong secret. Fix: restore the project from the Supabase dashboard.
+- public.video_shots table: RLS disabled and no longer used. Candidate for dropping.
+- Agnes: 1 request/minute for this account. 40 shots take 45+ minutes. Real renders
+  can take 14-38 minutes under load.
+- The public video_clips bucket
