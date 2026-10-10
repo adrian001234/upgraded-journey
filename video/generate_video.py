@@ -126,6 +126,16 @@ MAX_SHOTS_PER_RUN = 30
 # GitHub mid-render.
 RUN_TIME_BUDGET_SECONDS = 260 * 60
 
+# CHARACTER REFERENCE (2026-10-10): for the wordless Pebble format. When both
+# env vars are set, any shot whose prompt mentions CHARACTER_REFERENCE_NAME is
+# sent to Agnes as image-to-video starting from CHARACTER_REFERENCE_URL (same
+# "image" field Marius uses), so the character looks the same in every clip.
+# Shots that don't mention the name (wide establishing shots, etc.) are
+# rendered text-only exactly as before. If either var is unset, behavior is
+# unchanged from the old TechPulse flow.
+CHARACTER_REFERENCE_URL = os.environ.get("CHARACTER_REFERENCE_URL", "").strip()
+CHARACTER_REFERENCE_NAME = os.environ.get("CHARACTER_REFERENCE_NAME", "").strip().lower()
+
 
 class ContentPolicyRejection(Exception):
     pass
@@ -163,21 +173,24 @@ def frames_for_duration(duration_seconds, frame_rate=FRAME_RATE):
     return 8 * n + 1
 
 
-def submit_agnes_task(prompt, duration_seconds):
+def submit_agnes_task(prompt, duration_seconds, image_url=None):
     """RELIABILITY FIX (2026-08-06): retries 429/5xx with backoff instead
     of surfacing the first transient error straight to main(), where it
     would burn one of only RETRY_LIMIT=3 total per-shot attempts on
     something that had nothing to do with the prompt itself. A genuine
     content-policy rejection (400) is raised immediately as
     ContentPolicyRejection since retrying that can never succeed."""
-    body = json.dumps({
+    payload = {
         "model": AGNES_MODEL,
         "prompt": prompt,
         "height": HEIGHT,
         "width": WIDTH,
         "num_frames": frames_for_duration(duration_seconds),
         "frame_rate": FRAME_RATE,
-    }).encode()
+    }
+    if image_url:
+        payload["image"] = image_url
+    body = json.dumps(payload).encode()
 
     last_error_text = None
     for attempt in range(AGNES_MAX_RETRIES):
@@ -359,9 +372,14 @@ def render_one_shot():
     prompt = prompt.strip()
     duration = shot_durations[next_index]
 
-    print(f"Row {row_id}: rendering shot {next_index + 1}/{total_shots} (~{duration:.1f}s): {prompt[:80]!r}")
+    image_url = None
+    if CHARACTER_REFERENCE_URL and CHARACTER_REFERENCE_NAME and CHARACTER_REFERENCE_NAME in prompt.lower():
+        image_url = CHARACTER_REFERENCE_URL
+
+    print(f"Row {row_id}: rendering shot {next_index + 1}/{total_shots} (~{duration:.1f}s)"
+          f"{' [with character reference image]' if image_url else ''}: {prompt[:80]!r}")
     try:
-        video_id = submit_agnes_task(prompt, duration)
+        video_id = submit_agnes_task(prompt, duration, image_url)
         video_url = poll_agnes_task(video_id)
         local_path = f"/tmp/shot_{row_id}_{next_index:03d}.mp4"
         download_file(video_url, local_path)
