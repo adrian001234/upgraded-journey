@@ -355,4 +355,39 @@ def render_one_shot():
             return False
         print(f"Row {row_id}: shot {next_index + 1}/{total_shots} failed "
               f"(attempt {next_retry}/{RETRY_LIMIT}): {e}. Will retry next run.")
-        save_progress(row_id, video_urls,
+        save_progress(row_id, video_urls, next_retry)
+        return True
+
+
+def main():
+    run_start = time.monotonic()
+    shots_this_run = 0
+
+    while shots_this_run < MAX_SHOTS_PER_RUN:
+        elapsed = time.monotonic() - run_start
+        if elapsed >= RUN_TIME_BUDGET_SECONDS:
+            print(f"Run time budget ({RUN_TIME_BUDGET_SECONDS}s) reached after {shots_this_run} shot(s) - "
+                  f"stopping cleanly, next scheduled run continues.")
+            break
+
+        shot_start = time.monotonic()
+        made_progress = render_one_shot()
+        if not made_progress:
+            break
+        shots_this_run += 1
+
+        time_spent_on_shot = time.monotonic() - shot_start
+        remaining_pace = AGNES_MIN_SECONDS_BETWEEN_SUBMITS - time_spent_on_shot
+        if remaining_pace > 0 and shots_this_run < MAX_SHOTS_PER_RUN:
+            elapsed = time.monotonic() - run_start
+            if elapsed + remaining_pace >= RUN_TIME_BUDGET_SECONDS:
+                print(f"Pacing sleep would exceed the run time budget - stopping after {shots_this_run} shot(s) instead.")
+                break
+            print(f"Pacing {remaining_pace:.0f}s before next Agnes submission (staying under 1 req/min)...")
+            time.sleep(remaining_pace)
+
+    print(f"Run finished: {shots_this_run} shot(s) processed this run.")
+
+
+if __name__ == "__main__":
+    main()
