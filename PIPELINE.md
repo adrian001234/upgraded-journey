@@ -64,4 +64,10 @@ reference picture), reconcile_youtube.yml (manual, checks YouTube against Supaba
 - public.video_shots table: RLS disabled and no longer used. Candidate for dropping.
 - Agnes: 1 request/minute for this account. 40 shots take 45+ minutes. Real renders
   can take 14-38 minutes under load.
-- The public video_clips bucket
+- The public video_clips bucket keeps every clip. Cleanup after publish is not built.
+
+## GitHub write access
+Writes by Claude to this repo return 403 (retested 2026-10-10). All edits go through
+the GitHub web editor: Claude gives the exact
+https://github.com/adrian001234/upgraded-journey/edit/main/<path> link and the full
+file, the owner pastes and commits, then Claude re-verifies live.
