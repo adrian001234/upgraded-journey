@@ -27,7 +27,7 @@ jobs:
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
           CHARACTER_REFERENCE_URL: ${{ vars.CHARACTER_REFERENCE_URL }}
           CHARACTER_REFERENCE_NAME: ${{ vars.CHARACTER_REFERENCE_NAME }}
-        run: python video/generate_video.py
+        run: python -u video/generate_video.py
       - name: Assembly stage
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
