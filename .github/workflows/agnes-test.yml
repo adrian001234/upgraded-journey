@@ -6,7 +6,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - name: Test old and new Agnes model with a 4 second clip
+      - name: Test agnes-video-2.5-flash with a 4 second clip
         env:
           AGNES_API_KEY: ${{ secrets.AGNES_API_KEY }}
         run: |
@@ -14,12 +14,13 @@ jobs:
           import json, os, time, urllib.request, urllib.error
 
           KEY = os.environ["AGNES_API_KEY"]
+          MODEL = "agnes-video-2.5-flash"
           SUBMIT = "https://apihub.agnes-ai.com/v1/videos"
           POLL = "https://apihub.agnes-ai.com/agnesapi"
           H = {"Authorization": "Bearer " + KEY, "Content-Type": "application/json"}
 
-          def poll(video_id, model):
-              url = POLL + "?video_id=" + str(video_id) + "&model_name=" + model
+          def poll(video_id):
+              url = POLL + "?video_id=" + str(video_id) + "&model_name=" + MODEL
               last = None
               waited = 0
               while waited < 900:
@@ -43,36 +44,30 @@ jobs:
                   waited += 10
               print("Not finished after 900s", flush=True)
 
-          def attempt(model):
-              print("=== TEST MODEL:", model, flush=True)
-              payload = {
-                  "model": model,
-                  "prompt": "A small orange garden snail slowly crawling across a sunny green lawn, 3D animated style.",
-                  "mode": "text",
-                  "seconds": "4",
-                  "size": "720P",
-                  "aspect_ratio": "16:9",
-                  "n": 1,
-              }
-              req = urllib.request.Request(SUBMIT, data=json.dumps(payload).encode(), method="POST", headers=H)
-              t = time.time()
-              try:
-                  with urllib.request.urlopen(req, timeout=60) as r:
-                      body = r.read().decode(errors="replace")
-                      print("HTTP", r.status, "after", round(time.time() - t, 1), "s", flush=True)
-                      print("Body:", body[:500], flush=True)
-                      data = json.loads(body)
-                      vid = data.get("video_id") or data.get("id")
-                      if vid:
-                          poll(vid, model)
-              except urllib.error.HTTPError as e:
-                  print("HTTP", e.code, "after", round(time.time() - t, 1), "s", flush=True)
-                  print("Body:", e.read().decode(errors="replace")[:500], flush=True)
-              except Exception as e:
-                  print("ERROR:", repr(e), flush=True)
-
-          attempt("agnes-video-v2.0")
-          print("Waiting 70 seconds (Agnes allows about 1 request per minute)...", flush=True)
-          time.sleep(70)
-          attempt("agnes-video-2.5-flash")
+          print("=== TEST MODEL:", MODEL, flush=True)
+          payload = {
+              "model": MODEL,
+              "prompt": "A small orange garden snail slowly crawling across a sunny green lawn, 3D animated style.",
+              "mode": "text",
+              "seconds": "4",
+              "size": "720P",
+              "aspect_ratio": "16:9",
+              "n": 1,
+          }
+          req = urllib.request.Request(SUBMIT, data=json.dumps(payload).encode(), method="POST", headers=H)
+          t = time.time()
+          try:
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  body = r.read().decode(errors="replace")
+                  print("HTTP", r.status, "after", round(time.time() - t, 1), "s", flush=True)
+                  print("Body:", body[:500], flush=True)
+                  data = json.loads(body)
+                  vid = data.get("video_id") or data.get("id")
+                  if vid:
+                      poll(vid)
+          except urllib.error.HTTPError as e:
+              print("HTTP", e.code, "after", round(time.time() - t, 1), "s", flush=True)
+              print("Body:", e.read().decode(errors="replace")[:500], flush=True)
+          except Exception as e:
+              print("ERROR:", repr(e), flush=True)
           PY
