@@ -6,99 +6,73 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - name: Test Agnes with a 4 second clip
+      - name: Test old and new Agnes model with a 4 second clip
         env:
           AGNES_API_KEY: ${{ secrets.AGNES_API_KEY }}
-          REF_URL: ${{ vars.CHARACTER_REFERENCE_URL }}
         run: |
           python - <<'PY'
           import json, os, time, urllib.request, urllib.error
 
           KEY = os.environ["AGNES_API_KEY"]
-          REF = os.environ.get("REF_URL", "").strip()
           SUBMIT = "https://apihub.agnes-ai.com/v1/videos"
           POLL = "https://apihub.agnes-ai.com/agnesapi"
-          MODEL = "agnes-video-2.5-flash"
           H = {"Authorization": "Bearer " + KEY, "Content-Type": "application/json"}
 
-          def submit(label, payload):
-              print("=== TEST:", label, flush=True)
-              req = urllib.request.Request(SUBMIT, data=json.dumps(payload).encode(), method="POST", headers=H)
-              t = time.time()
-              try:
-                  with urllib.request.urlopen(req, timeout=60) as r:
-                      body = r.read().decode(errors="replace")
-                      print("HTTP", r.status, "after", round(time.time() - t, 1), "s")
-                      print("Response headers:", dict(r.headers))
-                      print("Body:", body[:500])
-                      data = json.loads(body)
-                      return data.get("video_id") or data.get("id")
-              except urllib.error.HTTPError as e:
-                  print("HTTP", e.code, "after", round(time.time() - t, 1), "s")
-                  print("Response headers:", dict(e.headers))
-                  print("Body:", e.read().decode(errors="replace")[:500])
-                  return None
-              except Exception as e:
-                  print("ERROR:", repr(e))
-                  return None
-
-          def poll(video_id):
-              url = POLL + "?video_id=" + str(video_id) + "&model_name=" + MODEL
+          def poll(video_id, model):
+              url = POLL + "?video_id=" + str(video_id) + "&model_name=" + model
               last = None
               waited = 0
-              while waited < 600:
+              while waited < 900:
                   try:
                       req = urllib.request.Request(url, headers=H)
                       with urllib.request.urlopen(req, timeout=30) as r:
                           data = json.loads(r.read())
                       status = data.get("status")
                       if status != last:
-                          print("status:", status, "after", waited, "s")
+                          print("status:", status, "after", waited, "s", flush=True)
                           last = status
                       if status == "completed":
-                          print("DONE. Video URL:", data.get("url") or data.get("video_url"))
+                          print("DONE. Video URL:", data.get("url") or data.get("video_url"), flush=True)
                           return
                       if status == "failed":
-                          print("FAILED:", json.dumps(data)[:500])
+                          print("FAILED:", json.dumps(data)[:500], flush=True)
                           return
                   except Exception as e:
-                      print("poll error:", repr(e))
+                      print("poll error:", repr(e), flush=True)
                   time.sleep(10)
                   waited += 10
-              print("Not finished after 600s")
+              print("Not finished after 900s", flush=True)
 
-          base = {
-              "model": MODEL,
-              "mode": "text",
-              "seconds": "4",
-              "size": "720P",
-              "aspect_ratio": "16:9",
-              "n": 1,
-          }
+          def attempt(model):
+              print("=== TEST MODEL:", model, flush=True)
+              payload = {
+                  "model": model,
+                  "prompt": "A small orange garden snail slowly crawling across a sunny green lawn, 3D animated style.",
+                  "mode": "text",
+                  "seconds": "4",
+                  "size": "720P",
+                  "aspect_ratio": "16:9",
+                  "n": 1,
+              }
+              req = urllib.request.Request(SUBMIT, data=json.dumps(payload).encode(), method="POST", headers=H)
+              t = time.time()
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      body = r.read().decode(errors="replace")
+                      print("HTTP", r.status, "after", round(time.time() - t, 1), "s", flush=True)
+                      print("Body:", body[:500], flush=True)
+                      data = json.loads(body)
+                      vid = data.get("video_id") or data.get("id")
+                      if vid:
+                          poll(vid, model)
+              except urllib.error.HTTPError as e:
+                  print("HTTP", e.code, "after", round(time.time() - t, 1), "s", flush=True)
+                  print("Body:", e.read().decode(errors="replace")[:500], flush=True)
+              except Exception as e:
+                  print("ERROR:", repr(e), flush=True)
 
-          text_payload = dict(base)
-          text_payload["prompt"] = "A small orange garden snail slowly crawling across a sunny green lawn, 3D animated style."
-          vid = submit("text only, 4 seconds, no picture", text_payload)
-          if vid:
-              poll(vid)
-          else:
-              print("Text-only request was NOT accepted.")
-
+          attempt("agnes-video-v2.0")
           print("Waiting 70 seconds (Agnes allows about 1 request per minute)...", flush=True)
           time.sleep(70)
-
-          if REF:
-              ref_payload = dict(base)
-              ref_payload["mode"] = "reference"
-              ref_payload["images"] = [REF]
-              ref_payload["prompt"] = ("Use the character and art style in <Picture 1> as reference, "
-                                       "keeping her appearance exactly the same. "
-                                       "Mimsi the snail slowly crawls across a sunny green lawn.")
-              vid2 = submit("reference picture, 4 seconds", ref_payload)
-              if vid2:
-                  poll(vid2)
-              else:
-                  print("Reference request was NOT accepted.")
-          else:
-              print("CHARACTER_REFERENCE_URL is empty, skipping the reference test.")
+          attempt("agnes-video-2.5-flash")
           PY
